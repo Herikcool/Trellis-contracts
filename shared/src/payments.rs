@@ -130,6 +130,24 @@ pub struct EscrowRecord {
     pub expiry_ledger: u32,
     /// Current lifecycle state.
     pub state: EscrowState,
+    /// Amount already released to beneficiary (for milestone releases).
+    pub released_amount: i128,
+    /// Amount already refunded to depositor (for dispute resolution).
+    pub refunded_amount: i128,
+    /// Milestone configuration (optional).
+    pub milestones: Option<soroban_sdk::Vec<Milestone>>,
+}
+
+/// A milestone in a multi-stage escrow release.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    /// Milestone identifier.
+    pub id: u32,
+    /// Amount to release at this milestone.
+    pub amount: i128,
+    /// Whether this milestone has been released.
+    pub released: bool,
 }
 
 // ===========================================================================
@@ -399,6 +417,9 @@ pub fn create_escrow(
         amount,
         expiry_ledger,
         state: EscrowState::Active,
+        released_amount: 0,
+        refunded_amount: 0,
+        milestones: None,
     };
     store_escrow(env, &record);
 
@@ -524,6 +545,154 @@ pub fn refund_escrow(env: &Env, token: &Address, escrow_id: u64) -> Result<(), E
         PAYMENT_ESCROW_REFUNDED,
         (escrow_id, record.depositor, record.amount),
     );
+
+    Ok(())
+}
+
+/// Release a milestone amount from an escrow deposit.
+///
+/// Allows partial releases for multi-stage payments. The amount must not
+/// exceed the remaining unreleased amount.
+///
+/// # Errors
+/// * [`Error::PaymentEscrowNotFound`] — no record for `escrow_id`.
+/// * [`Error::PaymentEscrowAlreadyReleased`] — escrow is fully released.
+/// * [`Error::PaymentEscrowAlreadyRefunded`] — escrow is already refunded.
+/// * [`Error::PaymentInvalidAmount`] — amount exceeds remaining balance.
+///
+/// # Events
+/// Emits [`PAYMENT_ESCROW_RELEASED`] with `(escrow_id, beneficiary, amount)`.
+pub fn release_milestone(
+    env: &Env,
+    token: &Address,
+    escrow_id: u64,
+    amount: i128,
+) -> Result<(), Error> {
+    validate_amount(amount)?;
+
+    let mut record: EscrowRecord =
+        persistent_read(env, &escrow_key(escrow_id)).ok_or(Error::PaymentEscrowNotFound)?;
+
+    if record.state == EscrowState::Refunded {
+        return Err(Error::PaymentEscrowAlreadyRefunded);
+    }
+
+    let remaining = record.amount - record.released_amount - record.refunded_amount;
+    if amount > remaining {
+        return Err(Error::PaymentInvalidAmount);
+    }
+
+    // Update released amount before transfer.
+    record.released_amount = record
+        .released_amount
+        .checked_add(amount)
+        .ok_or(Error::PaymentFeeOverflow)?;
+
+    // Check if fully released.
+    if record.released_amount == record.amount {
+        record.state = EscrowState::Released;
+        remove_from_active(env, escrow_id);
+    }
+
+    persistent_set(env, &escrow_key(escrow_id), &record);
+
+    // Transfer from contract to beneficiary.
+    let client = token::Client::new(env, token);
+    client.transfer(
+        &env.current_contract_address(),
+        &record.beneficiary,
+        &amount,
+    );
+
+    emit(
+        env,
+        PAYMENT_ESCROW_RELEASED,
+        (escrow_id, record.beneficiary, amount),
+    );
+
+    Ok(())
+}
+
+/// Resolve a dispute by splitting escrowed funds between depositor and beneficiary.
+///
+/// Allows partial arbitration in case of disputes. The total split must equal
+/// the remaining escrowed amount.
+///
+/// # Errors
+/// * [`Error::PaymentEscrowNotFound`] — no record for `escrow_id`.
+/// * [`Error::PaymentEscrowAlreadyReleased`] — escrow is fully released.
+/// * [`Error::PaymentEscrowAlreadyRefunded`] — escrow is already refunded.
+/// * [`Error::PaymentInvalidAmount`] — split amounts don't match remaining balance.
+///
+/// # Events
+/// Emits both [`PAYMENT_ESCROW_RELEASED`] and [`PAYMENT_ESCROW_REFUNDED`].
+pub fn resolve_dispute(
+    env: &Env,
+    token: &Address,
+    escrow_id: u64,
+    beneficiary_amount: i128,
+    refund_amount: i128,
+) -> Result<(), Error> {
+    let mut record: EscrowRecord =
+        persistent_read(env, &escrow_key(escrow_id)).ok_or(Error::PaymentEscrowNotFound)?;
+
+    if record.state == EscrowState::Released {
+        return Err(Error::PaymentEscrowAlreadyReleased);
+    }
+    if record.state == EscrowState::Refunded {
+        return Err(Error::PaymentEscrowAlreadyRefunded);
+    }
+
+    let remaining = record.amount - record.released_amount - record.refunded_amount;
+    if beneficiary_amount + refund_amount != remaining {
+        return Err(Error::PaymentInvalidAmount);
+    }
+
+    // Update amounts before transfers.
+    record.released_amount = record
+        .released_amount
+        .checked_add(beneficiary_amount)
+        .ok_or(Error::PaymentFeeOverflow)?;
+    record.refunded_amount = record
+        .refunded_amount
+        .checked_add(refund_amount)
+        .ok_or(Error::PaymentFeeOverflow)?;
+
+    // Mark as fully resolved.
+    record.state = EscrowState::Released;
+    remove_from_active(env, escrow_id);
+
+    persistent_set(env, &escrow_key(escrow_id), &record);
+
+    let client = token::Client::new(env, token);
+
+    // Transfer beneficiary portion.
+    if beneficiary_amount > 0 {
+        client.transfer(
+            &env.current_contract_address(),
+            &record.beneficiary,
+            &beneficiary_amount,
+        );
+        emit(
+            env,
+            PAYMENT_ESCROW_RELEASED,
+            (escrow_id, record.beneficiary, beneficiary_amount),
+        );
+    }
+
+    // Transfer refund portion.
+    if refund_amount > 0 {
+        client.transfer(
+            &env.current_contract_address(),
+            &record.depositor,
+            &refund_amount,
+        );
+        emit(
+            env,
+            PAYMENT_ESCROW_REFUNDED,
+            (escrow_id, record.depositor, refund_amount),
+        );
+    }
 
     Ok(())
 }

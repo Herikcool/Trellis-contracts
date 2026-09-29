@@ -67,6 +67,8 @@ enum DataKey {
     ReferralRecord(Address),
     Accrued(Address),
     LifetimeAccrued(Address),
+    ReferralCode(Symbol),
+    AddressToCode(Address),
 }
 
 #[contracttype]
@@ -476,6 +478,88 @@ impl ReferralContract {
             env.ledger().timestamp(),
         );
         Ok(amount)
+    }
+
+    /// Register a vanity referral code for an address.
+    ///
+    /// Only callable by admin. Codes must be alphanumeric, 3-16 characters,
+    /// and unique across the system.
+    pub fn register_referral_code(
+        env: Env,
+        caller: Address,
+        owner: Address,
+        code: Symbol,
+    ) -> Result<(), Error> {
+        require_admin(&env, &caller)?;
+
+        // Check uniqueness
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::ReferralCode(code.clone()))
+            .is_some()
+        {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Check owner doesn't already have a code
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Symbol>(&DataKey::AddressToCode(owner.clone()))
+            .is_some()
+        {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Store mappings
+        env.storage()
+            .instance()
+            .set(&DataKey::ReferralCode(code.clone()), &owner);
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressToCode(owner.clone()), &code);
+
+        emit_action_executed(
+            &env,
+            symbol_short!("referral"),
+            symbol_short!("reg_code"),
+            &caller,
+            true,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Register a wallet using a vanity referral code instead of raw address.
+    ///
+    /// Resolves the code to the referrer address and performs standard registration.
+    pub fn register_by_code(env: Env, wallet: Address, code: Symbol) -> Result<(), Error> {
+        wallet.require_auth();
+
+        // Resolve code to referrer address
+        let referrer: Address = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::ReferralCode(code.clone()))
+            .ok_or(Error::InvalidArgument)?;
+
+        // Perform standard registration with resolved referrer
+        Self::register(env, wallet, referrer)
+    }
+
+    /// Get the vanity code for an address, if one exists.
+    pub fn get_code_by_address(env: Env, address: Address) -> Option<Symbol> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Symbol>(&DataKey::AddressToCode(address))
+    }
+
+    /// Get the address for a vanity code, if it exists.
+    pub fn get_address_by_code(env: Env, code: Symbol) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::ReferralCode(code))
     }
 }
 
@@ -1191,5 +1275,94 @@ mod tests {
         // Double claim returns 0
         let claimed2 = referral.claim_rewards(&tier_one);
         assert_eq!(claimed2, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Vanity referral codes tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_vanity_code_succeeds() {
+        let (env, referral_id, admin, _referred, _tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        let owner = Address::generate(&env);
+        let code = Symbol::new(&env, "ALICE2026");
+
+        referral.register_referral_code(&admin, &owner, &code);
+
+        // Verify mappings
+        assert_eq!(referral.get_address_by_code(code), Some(owner.clone()));
+        assert_eq!(referral.get_code_by_address(owner), Some(code));
+    }
+
+    #[test]
+    fn register_by_code_resolves_to_correct_referrer() {
+        let (env, referral_id, admin, _referred, tier_one, tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        // Register vanity code for tier_one
+        let code = Symbol::new(&env, "BOB2026");
+        referral.register_referral_code(&admin, &tier_one, &code);
+
+        // Bootstrap tier_one in the graph
+        referral.set_referrer(&admin, &tier_one, &tier_two);
+
+        // New wallet registers using code
+        let wallet = Address::generate(&env);
+        referral.register_by_code(&wallet, code);
+
+        // Verify referrer is tier_one
+        assert_eq!(referral.get_referrer(&wallet), Some(tier_one));
+    }
+
+    #[test]
+    fn duplicate_vanity_code_rejected() {
+        let (env, referral_id, admin, _referred, _tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+        let code = Symbol::new(&env, "SAVE2026");
+
+        referral.register_referral_code(&admin, &owner1, &code);
+
+        // Try to register same code for different owner
+        let result = referral.try_register_referral_code(&admin, &owner2, &code);
+        assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+    }
+
+    #[test]
+    fn owner_cannot_have_multiple_codes() {
+        let (env, referral_id, admin, _referred, _tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        let owner = Address::generate(&env);
+        let code1 = Symbol::new(&env, "CODE1");
+        let code2 = Symbol::new(&env, "CODE2");
+
+        referral.register_referral_code(&admin, &owner, &code1);
+
+        // Try to register second code for same owner
+        let result = referral.try_register_referral_code(&admin, &owner, &code2);
+        assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+    }
+
+    #[test]
+    fn non_admin_cannot_register_vanity_code() {
+        let (env, referral_id, _admin, _referred, _tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        let attacker = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let code = Symbol::new(&env, "HACK");
+
+        let result = referral.try_register_referral_code(&attacker, &owner, &code);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
     }
 }
