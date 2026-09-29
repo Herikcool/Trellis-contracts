@@ -8,6 +8,7 @@ pub mod canonical;
 pub mod client;
 pub mod compat;
 pub mod config;
+pub mod domain_events;
 pub mod dashboard;
 pub mod disclosure;
 pub mod error_taxonomy;
@@ -81,6 +82,8 @@ pub use config::{
     validate_feature_flag, validate_full_config, validate_network_id, validate_rpc_url,
     validate_secret_key, Environment, RedactedSecret,
 };
+pub use domain_events::{consumer_version, publish_event, validate_event, DomainEvent, EventSchema,
+    EventValidationError};
 pub use dashboard::{
     add_external_reference, create_partial_failure, generate_dashboard,
     generate_enhanced_dashboard, group_by_age, group_by_operation_type, group_by_retryability,
