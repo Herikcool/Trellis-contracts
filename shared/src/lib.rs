@@ -37,6 +37,7 @@ pub mod retention;
 pub mod sanitize;
 pub mod semantic;
 pub mod storage;
+pub mod stale_state;
 pub mod storage_version;
 pub mod telemetry;
 pub mod timeline;
@@ -190,6 +191,8 @@ pub use storage::{
     temporary_has, temporary_remove, temporary_set, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_TTL_THRESHOLD, TEMPORARY_BUMP_AMOUNT, TEMPORARY_TTL_THRESHOLD,
 };
+pub use stale_state::{detect as detect_stale_state, RecoveryAction, StaleStateReason,
+    StaleStateReport, StateSnapshot};
 pub use telemetry::{
     emit_failure, emit_operation, emit_outcome, emit_success, ledger_correlation, publish,
     ActorType, TelemetryEvent, TelemetryResult, TelemetryTimer, CORE_OPERATIONS, OP_ESCROW_CREATE,
