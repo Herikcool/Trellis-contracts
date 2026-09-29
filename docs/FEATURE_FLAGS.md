@@ -80,6 +80,12 @@ A missing flag config means enforcement stays on (the safer behavior). The
 default (disabled) state is covered by the existing quota tests plus the new
 `feature_flag_bypass_skips_enforcement_and_rolls_back` test.
 
+The helper returns an explicit `GateDecision`: `Legacy` for a missing or
+disabled flag and `Enabled` only after an administrator has written an enabled
+configuration. Contract paths should switch on this decision rather than
+treating a missing storage value as enabled. The rollback test verifies the
+decision returns to `Legacy` after `emergency_disable`.
+
 ## Validation
 
 ```bash

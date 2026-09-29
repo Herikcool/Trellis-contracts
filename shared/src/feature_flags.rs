@@ -37,6 +37,14 @@ pub enum FeatureFlagError {
     Disabled = 961,
 }
 
+/// Branch decision for a gated contract path. A missing or disabled flag must
+/// remain on the safe legacy path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateDecision {
+    Legacy,
+    Enabled,
+}
+
 /// Typed set of feature flags. Add a variant to introduce a new switch.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +139,11 @@ pub fn require_enabled(env: &Env, flag: &FeatureFlag) -> Result<(), FeatureFlagE
     } else {
         Err(FeatureFlagError::Disabled)
     }
+}
+
+/// Select the safe legacy path or the explicitly enabled path.
+pub fn decide(env: &Env, flag: &FeatureFlag) -> GateDecision {
+    if is_enabled(env, flag) { GateDecision::Enabled } else { GateDecision::Legacy }
 }
 
 /// Enable/disable a flag and/or set its staged-rollout weight.
@@ -261,5 +274,16 @@ mod tests {
         let status = flag_status(&env, &flag);
         assert!(status.enabled_now);
         assert_eq!(status.config.rollout_bps, 5_000);
+    }
+
+    #[test]
+    fn decision_defaults_to_legacy_and_rolls_back_to_legacy() {
+        let env = Env::default();
+        let flag = FeatureFlag::QuotaBypass;
+        assert_eq!(decide(&env, &flag), GateDecision::Legacy);
+        set_flag(&env, &flag, true, FULL_ROLLOUT_BPS).unwrap();
+        assert_eq!(decide(&env, &flag), GateDecision::Enabled);
+        emergency_disable(&env, &flag);
+        assert_eq!(decide(&env, &flag), GateDecision::Legacy);
     }
 }

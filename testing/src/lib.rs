@@ -16,6 +16,8 @@ pub mod sandbox;
 pub mod simulation;
 pub mod snapshot;
 pub mod upgrade;
+#[cfg(test)]
+mod amount_properties;
 
 pub use fuzzing::*;
 pub use helpers::*;
