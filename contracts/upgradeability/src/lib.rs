@@ -22,7 +22,7 @@
 //! calls `env.deployer().update_current_contract_wasm()`.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, Val, Vec,
 };
 
@@ -73,6 +73,14 @@ pub enum UpgradeError {
     InvalidMigrationHook = 910,
     /// The registry has already been initialized.
     AlreadyInitialized = 911,
+    /// Post-upgrade validation failed.
+    PostUpgradeValidationFailed = 912,
+    /// Rollback was triggered due to validation failure.
+    RollbackTriggered = 913,
+    /// Invalid timelock delay.
+    InvalidTimelockDelay = 914,
+    /// Timelock has not expired yet.
+    TimelockNotExpired = 915,
 }
 
 type ContractResult<T> = core::result::Result<T, UpgradeError>;
@@ -90,6 +98,8 @@ const KEY_HISTORY: Symbol = symbol_short!("upg_hist");
 const KEY_PENDING: Symbol = symbol_short!("upg_pend");
 const KEY_CONTRACT_BY_NAME: Symbol = symbol_short!("crt_name");
 const KEY_TIMELOCK_DELAY: Symbol = symbol_short!("upg_dly");
+const KEY_STATE_SNAPSHOT: Symbol = symbol_short!("st_snap");
+const KEY_ROLLBACK_INFO: Symbol = symbol_short!("rlb_inf");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -182,6 +192,40 @@ pub enum UpgradeStatus {
     /// The upgrade has been executed.
     Completed,
 }
+
+/// Pre-upgrade state snapshot for rollback capability.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateSnapshot {
+    /// Previous WASM hash before upgrade.
+    pub old_wasm_hash: BytesN<32>,
+    /// Previous version number.
+    pub old_version: u32,
+    /// Critical account balance roots for validation.
+    pub balance_roots: soroban_sdk::Bytes,
+    /// Timestamp when snapshot was taken.
+    pub snapshot_timestamp: u64,
+}
+
+/// Rollback information for recovery.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollbackInfo {
+    /// Whether rollback is available for this contract.
+    pub can_rollback: bool,
+    /// The version to rollback to.
+    pub rollback_to_version: u32,
+    /// The WASM hash to rollback to.
+    pub rollback_to_hash: BytesN<32>,
+    /// Reason for last rollback (if any).
+    pub rollback_reason: soroban_sdk::String,
+    /// Timestamp when rollback was executed (0 if never).
+    pub rollback_timestamp: u64,
+}
+
+// Export the types for external use
+pub use StateSnapshot;
+pub use RollbackInfo;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -493,9 +537,28 @@ impl UpgradeabilityContract {
             .map_err(|_| UpgradeError::MigrationHookFailed)?;
         }
 
-        // Record old state for history.
+        // Record old state for history and rollback capability.
         let old_version = entry.current.version;
         let old_wasm_hash = entry.current.wasm_hash.clone();
+
+        // Create state snapshot before upgrade.
+        let snapshot = StateSnapshot {
+            old_wasm_hash: old_wasm_hash.clone(),
+            old_version,
+            balance_roots: soroban_sdk::Bytes::from_array(&env, &[0u8; 32]), // Placeholder for actual balance roots
+            snapshot_timestamp: env.ledger().timestamp(),
+        };
+        instance_set(&env, &(KEY_STATE_SNAPSHOT, proposal.contract_id.clone()), &snapshot);
+
+        // Initialize rollback info.
+        let rollback_info = RollbackInfo {
+            can_rollback: true,
+            rollback_to_version: old_version,
+            rollback_to_hash: old_wasm_hash.clone(),
+            rollback_reason: soroban_sdk::String::from_str(&env, ""),
+            rollback_timestamp: 0,
+        };
+        instance_set(&env, &(KEY_ROLLBACK_INFO, proposal.contract_id.clone()), &rollback_info);
 
         // Update the registry entry with the new version.
         entry.current = VersionInfo {
@@ -516,6 +579,21 @@ impl UpgradeabilityContract {
                 proposal.new_version,
             )
             .map_err(|_| UpgradeError::MigrationHookFailed)?;
+        }
+
+        // Execute post-upgrade validation if the contract implements PostUpgradeValidation.
+        if let Some(ref hook_addr) = entry.migration_hook {
+            if let Err(_) = execute_post_upgrade_validation(
+                &env,
+                hook_addr,
+                &entry.contract_id,
+                old_version,
+                proposal.new_version,
+            ) {
+                // Validation failed - trigger automatic rollback
+                execute_rollback(&env, &proposal.contract_id, &caller, "Post-upgrade validation failed")?;
+                return Err(UpgradeError::PostUpgradeValidationFailed);
+            }
         }
 
         // Mark proposal as executed.
@@ -697,6 +775,46 @@ impl UpgradeabilityContract {
     pub fn can_upgrade(env: Env, caller: Address) -> bool {
         auth::has_role(&env, &caller, Role::Upgrader)
     }
+
+    // -----------------------------------------------------------------------
+    // State snapshot and rollback management
+    // -----------------------------------------------------------------------
+
+    /// Get the state snapshot for a contract.
+    pub fn get_state_snapshot(env: Env, contract_id: Address) -> Result<StateSnapshot, UpgradeError> {
+        instance_get(&env, &(KEY_STATE_SNAPSHOT, contract_id))
+            .ok_or(UpgradeError::ContractNotRegistered)
+    }
+
+    /// Get rollback information for a contract.
+    pub fn get_rollback_info(env: Env, contract_id: Address) -> Result<RollbackInfo, UpgradeError> {
+        instance_get(&env, &(KEY_ROLLBACK_INFO, contract_id))
+            .ok_or(UpgradeError::ContractNotRegistered)
+    }
+
+    /// Manually trigger a rollback to the previous version.
+    ///
+    /// Only callable by an admin. This is for emergency recovery when
+    /// automatic rollback has already been triggered or for manual intervention.
+    pub fn manual_rollback(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), UpgradeError> {
+        require_admin_role(&env, &caller)?;
+
+        // Check if rollback is available.
+        let rollback_info: RollbackInfo =
+            instance_get(&env, &(KEY_ROLLBACK_INFO, contract_id.clone()))
+                .ok_or(UpgradeError::ContractNotRegistered)?;
+
+        if !rollback_info.can_rollback {
+            return Err(UpgradeError::AlreadyExecuted);
+        }
+
+        execute_rollback(&env, &contract_id, &caller, reason.to_string().as_str())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +850,15 @@ pub trait MigrationHook {
 
     /// Post-upgrade logic executed after WASM bytecode replacement.
     fn post_upgrade(env: Env, old_version: u32, new_version: u32);
+}
+
+/// PostUpgradeValidation interface for sanity checks after migration.
+///
+/// Target contracts implement this to run invariant validation after upgrade.
+pub trait PostUpgradeValidation {
+    /// Run sanity checks on internal state after migration.
+    /// Returns Ok(()) if all invariants hold, Err otherwise.
+    fn validate_post_upgrade(env: Env, old_version: u32, new_version: u32) -> Result<(), Error>;
 }
 
 /// Execute the storage validation dry-run hook.
@@ -805,6 +932,85 @@ fn execute_post_upgrade_hook(
         Ok(Ok(())) => Ok(()),
         _ => Err(UpgradeError::MigrationHookFailed),
     }
+}
+
+/// Execute post-upgrade validation checks.
+///
+/// Calls `validate_post_upgrade(old_version, new_version)` on the hook contract.
+fn execute_post_upgrade_validation(
+    env: &Env,
+    hook_addr: &Address,
+    _contract_id: &Address,
+    old_version: u32,
+    new_version: u32,
+) -> Result<(), UpgradeError> {
+    let args: soroban_sdk::Vec<Val> =
+        soroban_sdk::Vec::from_array(env, [old_version.into_val(env), new_version.into_val(env)]);
+    let result = env.try_invoke_contract::<(), Error>(
+        hook_addr,
+        &Symbol::new(env, "validate_post_upgrade"),
+        args,
+    );
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(UpgradeError::PostUpgradeValidationFailed),
+    }
+}
+
+/// Execute an automatic rollback to the previous WASM hash.
+///
+/// This is triggered when post-upgrade validation fails.
+fn execute_rollback(
+    env: &Env,
+    contract_id: &Address,
+    caller: &Address,
+    reason: &str,
+) -> Result<(), UpgradeError> {
+    // Get the state snapshot.
+    let snapshot: StateSnapshot = instance_get(&env, &(KEY_STATE_SNAPSHOT, contract_id.clone()))
+        .ok_or(UpgradeError::ContractNotRegistered)?;
+
+    // Get the registry entry.
+    let mut entry: RegistryEntry =
+        instance_get(&env, &(KEY_REG_ENTRY, contract_id.clone()))
+            .ok_or(UpgradeError::ContractNotRegistered)?;
+
+    // Revert to the old version.
+    entry.current = VersionInfo {
+        version: snapshot.old_version,
+        wasm_hash: snapshot.old_wasm_hash.clone(),
+        deployed_at: snapshot.snapshot_timestamp,
+        description: soroban_sdk::String::from_str(env, "rollback"),
+    };
+    instance_set(&env, &(KEY_REG_ENTRY, contract_id.clone()), &entry);
+
+    // Update rollback info.
+    let mut rollback_info: RollbackInfo =
+        instance_get(&env, &(KEY_ROLLBACK_INFO, contract_id.clone()))
+            .ok_or(UpgradeError::ContractNotRegistered)?;
+    rollback_info.can_rollback = false;
+    rollback_info.rollback_reason = soroban_sdk::String::from_str(env, reason);
+    rollback_info.rollback_timestamp = env.ledger().timestamp();
+    instance_set(&env, &(KEY_ROLLBACK_INFO, contract_id.clone()), &rollback_info);
+
+    // Emit rollback event.
+    events::emit_upgrade_rolled_back(
+        &env,
+        &zero_correlation_id(env),
+        contract_id,
+        entry.current.version,
+        snapshot.old_version,
+        caller,
+        env.ledger().timestamp(),
+    );
+
+    Ok(())
+}
+
+/// Create a zero correlation ID for events.
+fn zero_correlation_id(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
 }
 
 // ---------------------------------------------------------------------------

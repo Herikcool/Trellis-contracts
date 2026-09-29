@@ -39,6 +39,8 @@ const DEFAULT_REFERRAL_REWARD_CAP: i128 = 10_000_000_000;
 pub const MAX_GOVERNANCE_ADMINS: u32 = 20;
 /// Proposals are actionable for 30 days after creation.
 pub const PROPOSAL_LIFETIME: u64 = 30 * 24 * 60 * 60;
+/// Maximum number of actions in a batch proposal.
+pub const MAX_BATCH_SIZE: u32 = 10;
 
 type ContractResult<T> = core::result::Result<T, Error>;
 
@@ -106,6 +108,8 @@ pub enum ProposalAction {
     Pause,
     /// Unpause the contract.
     Unpause,
+    /// Execute multiple actions atomically.
+    Batch(soroban_sdk::Vec<ProposalAction>),
 }
 
 /// Status of a proposal.
@@ -630,6 +634,7 @@ fn action_symbol(action: &ProposalAction) -> Symbol {
         ProposalAction::SetTargetParameter(..) => symbol_short!("set_tgt"),
         ProposalAction::Pause => symbol_short!("pause"),
         ProposalAction::Unpause => symbol_short!("unpause"),
+        ProposalAction::Batch(..) => symbol_short!("batch"),
     }
 }
 
@@ -680,6 +685,20 @@ fn execute_action(env: &Env, action: &ProposalAction) -> ContractResult<()> {
         }
         ProposalAction::Unpause => {
             shared::storage::set_paused(env, false);
+        }
+        ProposalAction::Batch(actions) => {
+            // Validate batch size
+            if actions.len() > MAX_BATCH_SIZE {
+                return Err(Error::InvalidArgument);
+            }
+
+            // Execute each action sequentially - all must succeed or all fail
+            let mut i = 0;
+            while i < actions.len() {
+                let action = actions.get(i).ok_or(Error::InvalidArgument)?;
+                execute_action(env, &action)?;
+                i += 1;
+            }
         }
     }
     Ok(())
@@ -1140,6 +1159,75 @@ mod tests {
 
         let result = client.try_get_proposal(&999);
         assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch proposal execution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn batch_proposal_executes_multiple_actions_atomically() {
+        let (env, client, admin) = setup();
+        let admins = client.get_admin_set();
+        let second_admin = admins.get(1).unwrap();
+        let user = Address::generate(&env);
+
+        // Create batch proposal with multiple actions
+        let mut actions = soroban_sdk::Vec::new(&env);
+        actions.push_back(ProposalAction::GrantRole(user.clone(), Role::Upgrader));
+        actions.push_back(ProposalAction::SetParameter(ParameterKey::AidDefaultExpiry, 120));
+
+        let proposal_id = client.propose(&admin, &ProposalAction::Batch(actions.clone()));
+
+        // Approve and execute
+        client.approve(&admin, &proposal_id);
+        client.approve(&second_admin, &proposal_id);
+        client.execute(&admin, &proposal_id);
+
+        // Verify all actions were executed
+        assert!(client.has_role(&user, &Role::Upgrader));
+        assert_eq!(client.aid_default_expiry(), 120);
+    }
+
+    #[test]
+    fn batch_proposal_fails_if_action_count_exceeds_limit() {
+        let (env, client, admin) = setup();
+
+        // Create batch with too many actions
+        let mut actions = soroban_sdk::Vec::new(&env);
+        for _ in 0..11 {
+            actions.push_back(ProposalAction::Pause);
+        }
+
+        let result = client.try_propose(&admin, &ProposalAction::Batch(actions));
+        assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+    }
+
+    #[test]
+    fn batch_proposal_rolls_back_on_partial_failure() {
+        let (env, client, admin) = setup();
+        let admins = client.get_admin_set();
+        let second_admin = admins.get(1).unwrap();
+        let user = Address::generate(&env);
+
+        // Create batch with one valid and one invalid action
+        let mut actions = soroban_sdk::Vec::new(&env);
+        actions.push_back(ProposalAction::GrantRole(user.clone(), Role::Upgrader));
+        actions.push_back(ProposalAction::SetParameter(ParameterKey::AidDefaultExpiry, -1)); // Invalid value
+
+        let proposal_id = client.propose(&admin, &ProposalAction::Batch(actions.clone()));
+
+        // Approve
+        client.approve(&admin, &proposal_id);
+        client.approve(&second_admin, &proposal_id);
+
+        // Execute should fail due to invalid parameter
+        let result = client.try_execute(&admin, &proposal_id);
+        assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+
+        // Verify no actions were executed (atomic rollback)
+        assert!(!client.has_role(&user, &Role::Upgrader));
+        assert_ne!(client.aid_default_expiry(), -1);
     }
 
     // -----------------------------------------------------------------------
