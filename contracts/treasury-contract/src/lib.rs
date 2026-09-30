@@ -759,6 +759,9 @@ impl TreasuryContract {
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod invariants_test;
+
 /// CPU/memory regression suite for the treasury's critical entry points.
 /// Kept separate from `test` so the behavioural tests and the budget
 /// thresholds can be read (and updated) independently.

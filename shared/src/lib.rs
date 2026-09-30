@@ -20,6 +20,7 @@ pub mod history;
 pub mod idempotency;
 pub mod impersonation;
 pub mod import;
+pub mod invariants;
 pub mod jobs;
 pub mod lifecycle;
 pub mod lifecycle_events;
@@ -123,6 +124,7 @@ pub use import::{
     ImportItem, ImportMode, ImportReport, RollbackGuidance, RowError, StoredImportRecord,
     ABSOLUTE_MAX_IMPORT_SIZE, DEFAULT_MAX_IMPORT_SIZE, MAX_EXTERNAL_ID_LEN,
 };
+pub use invariants::*;
 pub use jobs::{
     configure_worker, dead_letter_job_ids, dedupe_key_pair, dedupe_key_u64, default_worker_config,
     discard_dead_letter, enqueue_escrow_refund, enqueue_job, get_job, get_receipt, job_stats,
