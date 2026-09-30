@@ -405,3 +405,6 @@ fn require_supported_token(env: &Env, token: &Address) -> Result<(), Error> {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod invariants_test;

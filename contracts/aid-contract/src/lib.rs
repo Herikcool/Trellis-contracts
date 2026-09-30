@@ -972,3 +972,6 @@ fn paginate(env: &Env, ids: &Vec<u64>, cursor: u32, limit: u32) -> AidPage {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod invariants_test;
