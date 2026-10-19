@@ -5,6 +5,8 @@
 //!   strictly rejecting dangerous schemes like javascript:, data:, file:, blob:)
 //! - Untrusted user text and markdown (stripping/rejecting control characters, CRLF injection,
 //!   and HTML script injection vectors).
+//! - High-cardinality telemetry protection: bounded label sets, redaction of sensitive
+//!   values, and deterministic sampling to keep dashboards useful under abusive input.
 
 use soroban_sdk::{Bytes, Env};
 use crate::errors::Error;
@@ -14,6 +16,22 @@ pub const MAX_URL_LEN: u32 = 2048;
 
 /// Maximum allowed untrusted text byte length.
 pub const MAX_TEXT_LEN: u32 = 8192;
+
+/// Maximum number of distinct label keys allowed on a single telemetry event.
+pub const MAX_TELEMETRY_LABELS: u32 = 16;
+
+/// Maximum byte length of a single telemetry label key or value.
+pub const MAX_TELEMETRY_LABEL_LEN: u32 = 128;
+
+/// Maximum byte length of a telemetry event name.
+pub const MAX_TELEMETRY_NAME_LEN: u32 = 64;
+
+/// Sampling denominator: 1 in `TELEMETRY_SAMPLE_RATE` events is retained.
+/// A value of 1 disables sampling (all events retained).
+pub const TELEMETRY_SAMPLE_RATE: u32 = 100;
+
+/// Replacement token emitted when a sensitive value is redacted.
+pub const REDACTED_TOKEN: &[u8] = b"[REDACTED]";
 
 /// Safe URI Scheme enum for classification.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -269,4 +287,202 @@ pub fn sanitize_text(env: &Env, raw: &Bytes, max_len: u32, allow_multiline: bool
     let trimmed = trim_whitespace(env, raw);
     validate_safe_text(&trimmed, max_len, allow_multiline)?;
     Ok(trimmed)
+}
+
+/// Classification of a telemetry label key for cardinality budgeting.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LabelClass {
+    /// Low-cardinality, safe to aggregate on (e.g. `status`, `chain`).
+    Bounded,
+    /// High-cardinality, must be hashed or dropped (e.g. `user_id`, `tx_hash`).
+    Unbounded,
+}
+
+/// Returns true if the label key is known to be high-cardinality and therefore
+/// unsafe to use as a raw metric dimension.
+#[inline]
+fn is_high_cardinality_key(key: &Bytes) -> bool {
+    // Keys are matched case-insensitively against a small denylist of
+    // identifiers that would explode metric cardinality if used as labels.
+    const HIGH_CARDINALITY: &[&[u8]] = &[
+        b"user_id",
+        b"userid",
+        b"account",
+        b"account_id",
+        b"address",
+        b"wallet",
+        b"tx_hash",
+        b"txhash",
+        b"transaction_id",
+        b"request_id",
+        b"trace_id",
+        b"session_id",
+        b"nonce",
+        b"timestamp",
+        b"email",
+        b"ip",
+        b"ip_address",
+    ];
+    for &k in HIGH_CARDINALITY {
+        if key.len() == k.len() as u32 && contains_case_insensitive(key, k) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if the label key names a sensitive field whose value must be
+/// redacted before being emitted to logs or metrics.
+#[inline]
+fn is_sensitive_key(key: &Bytes) -> bool {
+    const SENSITIVE: &[&[u8]] = &[
+        b"secret",
+        b"password",
+        b"passwd",
+        b"token",
+        b"api_key",
+        b"apikey",
+        b"private_key",
+        b"privatekey",
+        b"seed",
+        b"mnemonic",
+        b"authorization",
+        b"auth",
+        b"cookie",
+        b"signature",
+        b"signing_key",
+    ];
+    for &k in SENSITIVE {
+        if key.len() == k.len() as u32 && contains_case_insensitive(key, k) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validates a telemetry event name: bounded length, no control characters,
+/// and restricted to a conservative ASCII identifier alphabet.
+pub fn validate_telemetry_name(name: &Bytes) -> Result<(), Error> {
+    let len = name.len();
+    if len == 0 || len > MAX_TELEMETRY_NAME_LEN {
+        return Err(Error::InvalidArgument);
+    }
+    let mut i = 0u32;
+    while i < len {
+        let b = name.get(i).unwrap_or(0);
+        let ok = (b'a'..=b'z').contains(&b)
+            || (b'A'..=b'Z').contains(&b)
+            || (b'0'..=b'9').contains(&b)
+            || b == b'_'
+            || b == b'.'
+            || b == b'-';
+        if !ok {
+            return Err(Error::InvalidArgument);
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Validates a telemetry label key: bounded length, no control characters,
+/// and restricted to a conservative ASCII identifier alphabet.
+pub fn validate_telemetry_label_key(key: &Bytes) -> Result<(), Error> {
+    let len = key.len();
+    if len == 0 || len > MAX_TELEMETRY_LABEL_LEN {
+        return Err(Error::InvalidArgument);
+    }
+    let mut i = 0u32;
+    while i < len {
+        let b = key.get(i).unwrap_or(0);
+        let ok = (b'a'..=b'z').contains(&b)
+            || (b'A'..=b'Z').contains(&b)
+            || (b'0'..=b'9').contains(&b)
+            || b == b'_'
+            || b == b'.'
+            || b == b'-';
+        if !ok {
+            return Err(Error::InvalidArgument);
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Classifies a telemetry label key as bounded or unbounded cardinality.
+/// Unbounded keys must be hashed, bucketed, or dropped before emission.
+pub fn classify_telemetry_label(key: &Bytes) -> Result<LabelClass, Error> {
+    validate_telemetry_label_key(key)?;
+    if is_high_cardinality_key(key) {
+        Ok(LabelClass::Unbounded)
+    } else {
+        Ok(LabelClass::Bounded)
+    }
+}
+
+/// Redacts a telemetry label value if its key is sensitive. Non-sensitive
+/// values are returned unchanged (bounded by `MAX_TELEMETRY_LABEL_LEN`).
+pub fn redact_telemetry_value(env: &Env, key: &Bytes, value: &Bytes) -> Result<Bytes, Error> {
+    validate_telemetry_label_key(key)?;
+    if value.len() > MAX_TELEMETRY_LABEL_LEN {
+        return Err(Error::InvalidArgument);
+    }
+    if is_sensitive_key(key) {
+        let mut out = Bytes::new(env);
+        let mut i = 0usize;
+        while i < REDACTED_TOKEN.len() {
+            out.push_back(REDACTED_TOKEN[i]);
+            i += 1;
+        }
+        return Ok(out);
+    }
+    // Reject control characters in non-redacted values to prevent log injection.
+    let mut i = 0u32;
+    while i < value.len() {
+        let b = value.get(i).unwrap_or(0);
+        if b < 32 || b == 127 {
+            return Err(Error::InvalidArgument);
+        }
+        i += 1;
+    }
+    Ok(value.clone())
+}
+
+/// Deterministic sampling decision for a telemetry event. Returns `true` if
+/// the event should be emitted. Uses a caller-supplied entropy value (e.g. a
+/// ledger sequence or monotonic counter) so the decision is reproducible and
+/// does not require randomness inside the contract.
+pub fn should_sample(entropy: u64, sample_rate: u32) -> bool {
+    if sample_rate <= 1 {
+        return true;
+    }
+    (entropy % (sample_rate as u64)) == 0
+}
+
+/// Validates that a telemetry event's label set respects the cardinality
+/// budget. Returns `Err` if the number of labels exceeds `MAX_TELEMETRY_LABELS`
+/// or if any label key is invalid.
+pub fn validate_telemetry_label_count(count: u32) -> Result<(), Error> {
+    if count > MAX_TELEMETRY_LABELS {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// End-to-end guard for a single telemetry label: validates the key, enforces
+/// the cardinality budget, and redacts sensitive values. Returns the safe
+/// value to emit, or `Err` if the label must be dropped.
+pub fn sanitize_telemetry_label(
+    env: &Env,
+    key: &Bytes,
+    value: &Bytes,
+    current_label_count: u32,
+) -> Result<Bytes, Error> {
+    validate_telemetry_label_count(current_label_count)?;
+    let class = classify_telemetry_label(key)?;
+    if class == LabelClass::Unbounded {
+        // High-cardinality keys are rejected outright rather than emitted,
+        // preserving dashboard usefulness under abusive input volume.
+        return Err(Error::InvalidArgument);
+    }
+    redact_telemetry_value(env, key, value)
 }

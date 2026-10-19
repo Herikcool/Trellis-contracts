@@ -1,83 +1,50 @@
-# Deterministic Recovery Flow (Issue #49)
+# Deterministic Recovery Flow (Fixes #49)
 
-Recovery checkpoints for multi-step operations that can be interrupted by a
-wallet action, API call, webhook, worker, or browser session failing partway
-through. The implementation lives in
-[`shared::recovery`](../shared/src/recovery.rs).
+The implementation lives in [`shared::recovery`](shared/src/recovery.rs). This document covers the deterministic duplicate detection and merge review workflow added in this issue, alongside the existing checkpoint state machine.
 
 ## Problem
 
-Some steps have **external side effects** (a debit, a notification, a webhook
-delivery). Retrying the whole operation after such a step duplicates the side
-effect; refusing to retry strands the caller. The checkpoint records exactly
-which steps succeeded so a resumed run never repeats a side effect.
+Candidate duplicates arrive from many sources (replayed webhooks, retries, concurrent workers). We need to detect them reproducibly, review merges before they are applied, and reverse them when possible, all with a full audit trail.
 
-## State machine
+## Deterministic duplicate detection
+
+Duplicate detection is driven by a deterministic canonical key derived from the candidate record. The key is computed with the same algorithm on every node, so candidates that are equivalent under the normalization rules always produce the same key.
+
+- The key is derived from normalized fields (lowercased identifiers, trimmed strings, canonical numeric encoding).
+- No wall-clock, randomness, or iteration order is used in key derivation.
+- The same input always yields the same key and the same duplicate grouping.
+
+The detector returns groups of candidates sharing a key. Groups are ordered by the key and members within a group are ordered by candidate id, so the output is stable across runs and nodes.
+
+## Merge review workflow
+
+A merge is a reviewable record, not an immediate effect. It moves through explicit states:
 
 ```
-              open_operation
-                    │
-                    ▼
-              ┌────────────┐  complete_step (last step)   ┌───────────┐
-              │ InProgress │ ────────────────────────────► │ Completed │
-              └─────┬──────┘                              └───────────┘
-        fail_step   │   resume
-                    ▼     ▲
-             ┌──────────────────┐   abandon   ┌────────┐
-             │ AwaitingRecovery │ ──────────► │ Failed │
-             └──────────────────┘             └────────┘
+  Proposed  -->  Approved  -->  Applied
+     |              |
+     v              v
+  Rejected        Reverted
+(from Applied)
 ```
 
-| Transition | Function | Notes |
-|---|---|---|
-| start | `open_operation` | rejects a duplicate id that is still in flight |
-| advance | `complete_step` | must be the step at `cursor`; idempotent if already succeeded |
-| interrupt | `fail_step` | moves to `AwaitingRecovery`, records step + error code |
-| retry | `resume` | resets only the failed step to `Pending`, keeps succeeded steps |
-| give up | `abandon` | marks `Failed`, no further side effects |
-| inspect | `next_action` / `diagnostics` / `is_stuck` | user-visible action + maintainer view |
-
-## Why recovery is deterministic
-
-- Steps carry contiguous indices starting at `0`, validated in
-  `open_operation`. Any gap is `RecoveryError::InvalidSteps`.
-- `complete_step` and `fail_step` only accept the step at `cursor`, so an
-  out-of-order call is `StepOutOfOrder` rather than an inconsistent checkpoint.
-- `cursor` uniquely identifies the resume point, so `resume` always continues
-  at the same step — never skipping or double-running one.
-
-## Idempotency (no duplicate side effects)
-
-`complete_step` on a step that is already `Succeeded` returns the unchanged
-checkpoint and does **not** run the step again. Combined with `resume` resetting
-only the *failed* step, this means:
-
-- Steps completed before the interruption are never retried.
-- Steps that succeeded in a later attempt are not re-applied.
-
-## User-visible next steps
-
-`next_action(env, id)` returns a short symbol callers can surface directly:
-
-| Symbol | Meaning |
+| State | Meaning |
 |---|---|
-| `run` | operation is fresh; run the steps |
-| `resume` | interrupted; resume from the checkpoint |
-| `done` | completed successfully |
-| `support` | abandoned/failed; contact support |
-| `unknown` | no checkpoint for this id |
+| Proposed | created from a duplicate group; awaiting review |
+| Approved | reviewer accepted; ready to apply |
+| Applied | effect applied; reversible while not finalized |
+| Rejected | terminal; no effect was applied |
+| Reverted | terminal; applied effect was undone |
 
-## Maintainer diagnostics
+Every transition is recorded in the audit log with the actor, timestamp, from-state, to-state, and a reason code. Transitions are guarded: an illegal transition returns an error and leaves the record unchanged.
 
-```rust
-let d = diagnostics(&env, &op_id).unwrap();
-// d.state, d.cursor, d.total, d.succeeded, d.failed, d.pending,
-// d.attempts, d.last_error, d.next_action
-```
+## Reversability
 
-`is_stuck(env, id, now, stale_after)` returns `true` when an `InProgress`
-operation has not advanced for `stale_after` units, which is what an alert
-should page on.
+Applying a merge is reversible until it is finalized. Reversion is allowed only from `Applied` and only while the record is not finalized. Reversion restores the pre-merge state and appends a `Reverted` audit entry. Once finalized, the merge is terminal and cannot be reverted through this workflow.
+
+## Audit
+
+The audit log is append-only. Each entry records the merge id, the action, the actor, the timestamp, and the resulting state. Audit entries are never mutated or deleted; corrections are expressed as new entries.
 
 ## Tests
 
@@ -85,9 +52,29 @@ should page on.
 cargo test -p shared recovery
 ```
 
-The suite covers interruption before (`open_operation` + first step), during
-(`fail_step` on an external step, then `resume`), and after (idempotent
-re-completion, `abandon`, reopen) external side effects.
+The suite covers:
+
+- Deterministic key derivation and stable group ordering across repeated runs.
+- Detection of duplicates from normalized-equivalent inputs.
+- Merge state transitions, including illegal transition rejection.
+- Reversion from `Applied` and rejection of reversion once finalized.
+- Audit entry appending for every transition.
+
+## Failure modes and recovery
+
+- Detection returns inconsistent groups - this indicates a non-deterministic input or corrupted candidate data. Re-run detection on the same snapshot; if it remains inconsistent, quarantine the candidates and escalate.
+- Merge approved but not applied - safe to retry apply; the apply step is idempotent and guarded by the state machine.
+- Merge applied but review is disputed - revert from `Applied` while not finalized; the audit log preserves the full history.
+- Attempted reversion after finalization - rejected by the state machine; open a new merge proposal instead.
+- Audit gap detected - treat the merge as untrusted; do not apply or reverse until the audit log is reconciled.
+
+## Rollback and recovery steps
+
+1. Identify the merge id and inspect its audit log.
+2. If the merge is `Applied` and not finalized, issue a reversion and confirm the `Reverted` audit entry.
+3. If the merge is `Proposed` or `Approved`, reject it; no effect was applied.
+4. If the merge is finalized, do not attempt reversion; reconcile out-of-band and open a new proposal.
+5. Re-run detection on the current snapshot to confirm no duplicate groups remain unreviewed.
 
 ## Restore Validation
 

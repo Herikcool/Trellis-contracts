@@ -164,6 +164,17 @@ jobs:
       - name: Validate changelog/entries.json against changelog/schema.json
         run: node scripts/validate-changelog.cjs
 
+  # Release readiness gate verification (Issue #253).
+  # Blocks CI when migrations, security checks, smoke tests, or rollback rehearsals fail.
+  release-readiness-gate:
+    name: Release readiness gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify release readiness gate
+        run: node scripts/release-readiness-gate.cjs --check-all
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

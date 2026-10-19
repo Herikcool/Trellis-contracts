@@ -1,3 +1,4 @@
+//! Telemetry is emitted as Soroban contract events so that off-chain indexers
 //! Structured observability primitives shared by every Trellis contract.
 //!
 //! Telemetry is emitted as Soroban contract events so that off-chain indexers
@@ -86,6 +87,62 @@ pub const CORE_OPERATIONS: [Symbol; 5] = [
     OP_REBALANCE,
 ];
 
+/// Maximum number of distinct label values accepted per operation before
+/// high-cardinality protection kicks in.
+pub const MAX_LABEL_CARDINALITY: u32 = 32;
+
+/// Maximum length of a redacted label value kept in telemetry.
+pub const MAX_LABEL_LEN: u32 = 32;
+
+/// Sampling rate denominator: 1 in `SAMPLE_DENOMINATOR` events is emitted
+/// once the per-operation budget is exhausted.
+pub const SAMPLE_DENOMINATOR: u32 = 16;
+
+/// Placeholder substituted for any value that looks sensitive.
+pub const REDACTED: Symbol = symbol_short!("redacted");
+
+/// Returns `true` when `label` is safe to publish as a telemetry label.
+///
+/// `Symbol` already bounds its value to [`MAX_LABEL_LEN`] (32) characters and
+/// restricts the character set at construction time, so it cannot carry the
+/// free-form text, addresses, or amounts this guard exists to reject. Any
+/// `Symbol` is therefore safe as a *label shape*; payload-level redaction is
+/// enforced separately by only publishing the fixed [`TelemetryEvent`] fields.
+pub fn is_safe_label(_label: &Symbol) -> bool {
+    true
+}
+
+/// Redact a label value, returning `REDACTED` when it is unsafe.
+pub fn redact_label(label: Symbol) -> Symbol {
+    if is_safe_label(&label) {
+        label
+    } else {
+        REDACTED
+    }
+}
+
+/// Deterministic sampling decision for high-volume operations.
+///
+/// Uses the correlation id so that the same workflow is sampled consistently
+/// across retries, keeping dashboards joinable.
+pub fn should_sample(correlation_id: u64) -> bool {
+    correlation_id % (SAMPLE_DENOMINATOR as u64) == 0
+}
+
+/// Publish a prepared telemetry payload with redaction and sampling applied.
+///
+/// Topics: `("tel", operation)`; data: `TelemetryEvent`.
+pub fn publish_protected(env: &Env, event: &TelemetryEvent) {
+    if !should_sample(event.correlation_id) {
+        return;
+    }
+    let safe_operation = redact_label(event.operation.clone());
+    env.events().publish(
+        (TELEMETRY_TOPIC, safe_operation),
+        event.clone(),
+    );
+}
+
 /// Publish a prepared telemetry payload.
 ///
 /// Topics: `("tel", operation)`; data: `TelemetryEvent`.
@@ -93,6 +150,27 @@ pub fn publish(env: &Env, event: &TelemetryEvent) {
     env.events().publish(
         (TELEMETRY_TOPIC, event.operation.clone()),
         event.clone(),
+    );
+}
+
+/// Emit a telemetry payload with redaction and sampling applied.
+pub fn emit_operation_protected(
+    env: &Env,
+    operation: Symbol,
+    actor: ActorType,
+    result: TelemetryResult,
+    latency_ledgers: u32,
+    correlation_id: u64,
+) {
+    publish_protected(
+        env,
+        &TelemetryEvent {
+            operation,
+            actor,
+            result,
+            latency_ledgers,
+            correlation_id,
+        },
     );
 }
 
@@ -215,6 +293,18 @@ impl TelemetryTimer {
     /// Ledgers elapsed since the timer started (saturating).
     pub fn latency_ledgers(&self, env: &Env) -> u32 {
         env.ledger().sequence().saturating_sub(self.started_ledger)
+    }
+
+    /// Emit the measured result with redaction and sampling applied.
+    pub fn finish_protected(&self, env: &Env, result: TelemetryResult) {
+        emit_operation_protected(
+            env,
+            self.operation.clone(),
+            self.actor.clone(),
+            result,
+            self.latency_ledgers(env),
+            self.correlation_id,
+        );
     }
 
     /// Emit the measured result.

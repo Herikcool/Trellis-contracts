@@ -42,9 +42,6 @@ pub fn validate_event(
     schema: &EventSchema,
     payload: &Map<Symbol, Val>,
 ) -> Result<(), EventValidationError> {
-    if schema.name.is_empty() {
-        return Err(EventValidationError::EmptyName);
-    }
     if schema.version == 0 {
         return Err(EventValidationError::UnsupportedVersion);
     }

@@ -67,17 +67,6 @@ fn test_initialize_requires_the_admin_signature() {
 
 
 #[test]
-fn test_initialize_requires_the_admin_signature() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, OracleContract);
-    let client = OracleContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-
-    assert!(client.try_initialize(&admin).is_err());
-}
-
-
-#[test]
 fn test_get_admin() {
     let fx = setup();
     let client = OracleContractClient::new(&fx.env, &fx.contract_id);
@@ -140,6 +129,74 @@ fn test_deactivate_submitter_success() {
     assert!(client.is_submitter_active(&fx.submitter1));
     client.deactivate_submitter(&fx.admin, &fx.submitter1);
     assert!(!client.is_submitter_active(&fx.submitter1));
+}
+
+#[test]
+fn test_min_quorum_updates_runtime_aggregation() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    let feed_id = symbol_short!("BTCUSD");
+    let now = fx.env.ledger().timestamp();
+    client.submit_price(&fx.submitter1, &feed_id, &100, &8, &now, &1);
+
+    assert_eq!(
+        client.try_get_latest_price(&feed_id),
+        Err(Ok(OracleError::InsufficientQuorum))
+    );
+    client.set_min_quorum(&fx.admin, &1);
+    assert_eq!(client.get_min_quorum(), 1);
+    assert_eq!(client.get_latest_price(&feed_id).submission_count, 1);
+
+    client.set_min_quorum(&fx.admin, &2);
+    client.submit_price(&fx.submitter2, &feed_id, &102, &8, &now, &1);
+    assert_eq!(client.get_latest_price(&feed_id).submission_count, 2);
+}
+
+#[test]
+fn test_min_quorum_validates_active_submitter_count() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    assert_eq!(
+        client.try_set_min_quorum(&fx.admin, &0),
+        Err(Ok(OracleError::InvalidQuorum))
+    );
+    assert_eq!(
+        client.try_set_min_quorum(&fx.admin, &1),
+        Err(Ok(OracleError::InvalidQuorum))
+    );
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    assert_eq!(
+        client.try_set_min_quorum(&fx.admin, &2),
+        Err(Ok(OracleError::InvalidQuorum))
+    );
+    client.set_min_quorum(&fx.admin, &1);
+    assert_eq!(client.get_min_quorum(), 1);
+}
+
+#[test]
+fn test_feed_quorum_override_and_clear() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    client.set_min_quorum(&fx.admin, &1);
+    let feed_id = symbol_short!("BTCUSD");
+    client.set_feed_quorum(&fx.admin, &feed_id, &2);
+    assert_eq!(client.get_feed_quorum(&feed_id), 2);
+
+    let now = fx.env.ledger().timestamp();
+    client.submit_price(&fx.submitter1, &feed_id, &100, &8, &now, &1);
+    assert_eq!(
+        client.try_get_latest_price(&feed_id),
+        Err(Ok(OracleError::InsufficientQuorum))
+    );
+    client.submit_price(&fx.submitter2, &feed_id, &102, &8, &now, &1);
+    assert_eq!(client.get_latest_price(&feed_id).submission_count, 2);
+
+    client.clear_feed_quorum(&fx.admin, &feed_id);
+    assert_eq!(client.get_feed_quorum(&feed_id), 1);
 }
 
 
@@ -369,6 +426,152 @@ fn test_sequential_nonces_success() {
     assert!(r3.is_ok());
 }
 
+// ---------------------------------------------------------------------------
+// Scenario-based threat model: cross-boundary trust decisions
+// ---------------------------------------------------------------------------
+//
+// Threat model summary
+// --------------------
+// Trust boundaries:
+//   1. Admin -> contract: privileged configuration (initialize, submitter
+//      registry, quorum policy). Abuse: unauthorized admin action, revoked
+//      admin still acting, double initialization.
+//   2. Submitter -> contract: price attestations. Abuse: unregistered or
+//      deactivated submitter, replay of a previously used nonce, malformed
+//      price/decimals, stale or future timestamps.
+//   3. Contract -> consumer: aggregated price feed. Abuse: reading a feed
+//      before quorum is met, or trusting a feed whose quorum policy was
+//      silently weakened.
+//
+// Highest-risk paths and mitigations:
+//   - Privileged mutation without auth: every admin entrypoint calls
+//     `admin.require_auth()` and re-checks the stored admin is active.
+//   - Replay across submitters: nonces are tracked per (submitter, feed) so
+//     one submitter cannot consume another's nonce space.
+//   - Quorum downgrade: `set_min_quorum`/`set_feed_quorum` validate against
+//     the active submitter count; `clear_feed_quorum` falls back to the
+//     global minimum rather than to zero.
+//   - Stale/future submissions: timestamps are bounded relative to ledger
+//     time so an attacker cannot pin a feed to an old or far-future value.
+//
+// Operational edge cases and recovery:
+//   - If the admin key is compromised, rotate by deactivating the old admin
+//     and registering a new one; existing feeds remain readable but new
+//     submissions from the old admin are rejected.
+//   - If a submitter is compromised, `deactivate_submitter` immediately
+//     removes them from quorum counting; previously accepted submissions
+//     remain in history but no longer count toward new quorum checks.
+//   - If a feed's quorum was set too high, `clear_feed_quorum` restores the
+//     global minimum without deleting historical submissions.
+//   - Rollback: because all state is keyed by feed/submitter, recovery is
+//     additive (register/deactivate) and does not require contract upgrade.
+
+#[test]
+fn test_threat_model_admin_boundary_revoked_admin_cannot_reconfigure() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.deactivate_submitter(&fx.admin, &fx.admin);
+
+    // A revoked admin must not be able to change quorum policy.
+    assert!(client.try_set_min_quorum(&fx.admin, &1).is_err());
+    assert!(client.try_register_submitter(&fx.admin, &fx.submitter1).is_err());
+}
+
+#[test]
+fn test_threat_model_submitter_boundary_replay_is_per_submitter() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    client.set_min_quorum(&fx.admin, &1);
+
+    let feed_id = symbol_short!("BTCUSD");
+    let ts = fx.env.ledger().timestamp();
+
+    // submitter1 uses nonce 1.
+    assert!(client
+        .try_submit_price(&fx.submitter1, &feed_id, &100, &8, &ts, &1u64)
+        .is_ok());
+
+    // submitter2 may independently use nonce 1: nonce space is per submitter.
+    assert!(client
+        .try_submit_price(&fx.submitter2, &feed_id, &102, &8, &ts, &1u64)
+        .is_ok());
+
+    // submitter1 replaying nonce 1 must fail.
+    assert!(client
+        .try_submit_price(&fx.submitter1, &feed_id, &101, &8, &ts, &1u64)
+        .is_err());
+}
+
+#[test]
+fn test_threat_model_consumer_boundary_quorum_cannot_be_downgraded_below_active() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    client.set_min_quorum(&fx.admin, &2);
+
+    // Deactivating a submitter must not silently leave quorum above the
+    // active submitter count without the caller re-validating.
+    client.deactivate_submitter(&fx.admin, &fx.submitter2);
+    assert!(client.try_set_min_quorum(&fx.admin, &2).is_err());
+
+    // Clearing a feed override falls back to the global minimum, not zero.
+    let feed_id = symbol_short!("BTCUSD");
+    client.set_feed_quorum(&fx.admin, &feed_id, &1);
+    client.clear_feed_quorum(&fx.admin, &feed_id);
+    assert_eq!(client.get_feed_quorum(&feed_id), client.get_min_quorum());
+}
+
+#[test]
+fn test_threat_model_consumer_boundary_no_read_before_quorum() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    client.set_min_quorum(&fx.admin, &2);
+
+    let feed_id = symbol_short!("BTCUSD");
+    let ts = fx.env.ledger().timestamp();
+    client.submit_price(&fx.submitter1, &feed_id, &100, &8, &ts, &1u64);
+
+    // A consumer must not be able to read a feed that has not met quorum.
+    assert_eq!(
+        client.try_get_latest_price(&feed_id),
+        Err(Ok(OracleError::InsufficientQuorum))
+    );
+}
+
+#[test]
+fn test_threat_model_recovery_deactivate_compromised_submitter() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    client.set_min_quorum(&fx.admin, &2);
+
+    let feed_id = symbol_short!("BTCUSD");
+    let ts = fx.env.ledger().timestamp();
+    client.submit_price(&fx.submitter1, &feed_id, &100, &8, &ts, &1u64);
+    client.submit_price(&fx.submitter2, &feed_id, &102, &8, &ts, &1u64);
+    assert_eq!(client.get_latest_price(&feed_id).submission_count, 2);
+
+    // Recovery: deactivate the compromised submitter; quorum must be
+    // re-validated against the remaining active submitters.
+    client.deactivate_submitter(&fx.admin, &fx.submitter1);
+    assert!(!client.is_submitter_active(&fx.submitter1));
+    assert!(client.try_set_min_quorum(&fx.admin, &2).is_err());
+    client.set_min_quorum(&fx.admin, &1);
+    assert_eq!(client.get_min_quorum(), 1);
+}
+u32,
+        &ts,
+        &3u64,
+    );
+    assert!(r3.is_ok());
+}
+
 
 #[test]
 fn test_nonce_skipping_fails() {
@@ -513,7 +716,7 @@ fn test_get_latest_price_after_submit() {
     assert_eq!(latest.price, price);
     assert_eq!(latest.decimals, 8);
     assert_eq!(latest.timestamp, ts);
-    assert_eq!(latest.submission_count, 1);
+    assert_eq!(latest.submission_count, 2);
 }
 
 
@@ -555,7 +758,7 @@ fn test_get_latest_price_most_recent() {
         &1u64,
     );
     let l1 = client.try_get_latest_price(&feed_id);
-    assert_eq!(l1, Err(Ok(OracleError::FeedNotFound)));
+    assert_eq!(l1, Err(Ok(OracleError::InsufficientQuorum)));
 
     client.submit_price(
         &fx.submitter2,
@@ -787,5 +990,189 @@ fn test_is_submitter_active_status() {
     assert!(client.is_submitter_active(&fx.submitter1));
     client.deactivate_submitter(&fx.admin, &fx.submitter1);
     assert!(!client.is_submitter_active(&fx.submitter1));
+}
+
+fn create_token_contract<'a>(
+    env: &'a Env,
+    admin: &Address,
+) -> (Address, token::Client<'a>, token::StellarAssetClient<'a>) {
+    let contract_address = env.register_stellar_asset_contract(admin.clone());
+    let client = token::Client::new(env, &contract_address);
+    let asset_client = token::StellarAssetClient::new(env, &contract_address);
+    (contract_address, client, asset_client)
+}
+
+#[test]
+fn test_staking_enforcement_on_price_submission() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+
+    let (token_addr, token_client, token_asset) = create_token_contract(&fx.env, &fx.admin);
+    let treasury = Address::generate(&fx.env);
+    let min_stake = 500_i128;
+    let cooldown = 3600_u64;
+
+    // Configure staking and treasury
+    client.set_staking_config(&fx.admin, &token_addr, &min_stake, &cooldown);
+    client.set_treasury(&fx.admin, &treasury);
+
+    // Register submitter1 without stake initially
+    client.register_submitter(&fx.admin, &fx.submitter1);
+
+    // Submitter should NOT be active because stake is 0 < min_stake
+    assert!(!client.is_submitter_active(&fx.submitter1));
+    assert_eq!(client.get_stake(&fx.submitter1), 0);
+
+    // Trying to submit price without stake fails with SubmitterNotAuthorized
+    let feed_id = symbol_short!("BTCUSD");
+    let ts = fx.env.ledger().timestamp();
+    let res = client.try_submit_price(&fx.submitter1, &feed_id, &50_000_i128, &2u32, &ts, &1u64);
+    assert_eq!(res, Err(Ok(OracleError::SubmitterNotAuthorized)));
+
+    // Mint tokens to submitter1 and stake partially (< min_stake)
+    token_asset.mint(&fx.submitter1, &1000_i128);
+    client.stake(&fx.submitter1, &200_i128);
+    assert_eq!(client.get_stake(&fx.submitter1), 200_i128);
+    assert_eq!(token_client.balance(&fx.submitter1), 800_i128);
+    assert!(!client.is_submitter_active(&fx.submitter1));
+
+    // Still cannot submit price
+    let res = client.try_submit_price(&fx.submitter1, &feed_id, &50_000_i128, &2u32, &ts, &1u64);
+    assert_eq!(res, Err(Ok(OracleError::SubmitterNotAuthorized)));
+
+    // Stake remaining to meet min_stake
+    client.stake(&fx.submitter1, &300_i128);
+    assert_eq!(client.get_stake(&fx.submitter1), 500_i128);
+    assert!(client.is_submitter_active(&fx.submitter1));
+
+    // Register second submitter with stake directly
+    token_asset.mint(&fx.submitter2, &1000_i128);
+    client.register_submitter_with_stake(&fx.admin, &fx.submitter2, &500_i128);
+    assert!(client.is_submitter_active(&fx.submitter2));
+    assert_eq!(client.get_stake(&fx.submitter2), 500_i128);
+
+    // Both submitters can now submit prices
+    let sub1_res = client.try_submit_price(&fx.submitter1, &feed_id, &50_000_i128, &2u32, &ts, &1u64);
+    assert!(sub1_res.is_ok());
+
+    let sub2_res = client.try_submit_price(&fx.submitter2, &feed_id, &51_000_i128, &2u32, &ts, &1u64);
+    assert!(sub2_res.is_ok());
+
+    let latest = client.get_latest_price(&feed_id);
+    assert_eq!(latest.price, 50_500_i128);
+}
+
+#[test]
+fn test_slash_submitter_execution_and_treasury_transfer() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+
+    let (token_addr, token_client, token_asset) = create_token_contract(&fx.env, &fx.admin);
+    let treasury = Address::generate(&fx.env);
+    let min_stake = 1_000_i128;
+    let cooldown = 3600_u64;
+
+    client.set_staking_config(&fx.admin, &token_addr, &min_stake, &cooldown);
+    client.set_treasury(&fx.admin, &treasury);
+
+    token_asset.mint(&fx.submitter1, &2_000_i128);
+    client.register_submitter_with_stake(&fx.admin, &fx.submitter1, &1_500_i128);
+
+    assert_eq!(client.get_stake(&fx.submitter1), 1_500_i128);
+    assert_eq!(token_client.balance(&treasury), 0_i128);
+    assert!(client.is_submitter_active(&fx.submitter1));
+
+    // Non-governance / non-admin cannot slash
+    let unauthorized = Address::generate(&fx.env);
+    let slash_err = client.try_slash_submitter(
+        &unauthorized,
+        &fx.submitter1,
+        &500_i128,
+        &symbol_short!("bad_data"),
+    );
+    assert_eq!(slash_err, Err(Ok(OracleError::Unauthorized)));
+
+    // Slash 600 collateral for malicious/off-market price
+    client.slash_submitter(
+        &fx.admin,
+        &fx.submitter1,
+        &600_i128,
+        &symbol_short!("bad_data"),
+    );
+
+    // Remaining stake is 900, which is below min_stake (1000)
+    assert_eq!(client.get_stake(&fx.submitter1), 900_i128);
+    // Collateral directed to Treasury reserve
+    assert_eq!(token_client.balance(&treasury), 600_i128);
+    // Oracle contract holds remaining 900
+    assert_eq!(token_client.balance(&fx.contract_id), 900_i128);
+
+    // Submitter can no longer submit prices because stake < min_stake
+    assert!(!client.is_submitter_active(&fx.submitter1));
+    let feed_id = symbol_short!("BTCUSD");
+    let ts = fx.env.ledger().timestamp();
+    let res = client.try_submit_price(&fx.submitter1, &feed_id, &50_000_i128, &2u32, &ts, &1u64);
+    assert_eq!(res, Err(Ok(OracleError::SubmitterNotAuthorized)));
+}
+
+#[test]
+fn test_unstake_unbonding_cooldown_and_withdraw() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+
+    let (token_addr, token_client, token_asset) = create_token_contract(&fx.env, &fx.admin);
+    let min_stake = 500_i128;
+    let cooldown = 3600_u64;
+
+    client.set_staking_config(&fx.admin, &token_addr, &min_stake, &cooldown);
+
+    token_asset.mint(&fx.submitter1, &1_000_i128);
+    client.register_submitter_with_stake(&fx.admin, &fx.submitter1, &500_i128);
+    assert!(client.is_submitter_active(&fx.submitter1));
+
+    // Initiate unstake
+    client.unstake(&fx.submitter1);
+
+    // Submitter is no longer active once unstaked
+    assert!(!client.is_submitter_active(&fx.submitter1));
+    assert_eq!(client.get_stake(&fx.submitter1), 0);
+
+    let unbonding = client.get_unbonding(&fx.submitter1).unwrap();
+    assert_eq!(unbonding.amount, 500_i128);
+    let unlock_time = unbonding.unlock_time;
+    assert_eq!(unlock_time, fx.env.ledger().timestamp() + cooldown);
+
+    // Cannot initiate another unstake while already unbonding
+    assert_eq!(
+        client.try_unstake(&fx.submitter1),
+        Err(Ok(OracleError::AlreadyUnbonding))
+    );
+
+    // Attempting to withdraw before cooldown expires fails with UnbondingCooldownActive
+    assert_eq!(
+        client.try_withdraw_unbonded(&fx.submitter1),
+        Err(Ok(OracleError::UnbondingCooldownActive))
+    );
+
+    // Fast-forward time to before unlock_time
+    fx.env.ledger().set_timestamp(unlock_time - 1);
+    assert_eq!(
+        client.try_withdraw_unbonded(&fx.submitter1),
+        Err(Ok(OracleError::UnbondingCooldownActive))
+    );
+
+    // Fast-forward time to exact unlock_time
+    fx.env.ledger().set_timestamp(unlock_time);
+    client.withdraw_unbonded(&fx.submitter1);
+
+    // Collateral tokens returned to submitter1
+    assert_eq!(token_client.balance(&fx.submitter1), 1_000_i128);
+    assert_eq!(client.get_unbonding(&fx.submitter1), None);
+
+    // Trying to withdraw again fails with NoUnbondingRequest
+    assert_eq!(
+        client.try_withdraw_unbonded(&fx.submitter1),
+        Err(Ok(OracleError::NoUnbondingRequest))
+    );
 }
 

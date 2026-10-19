@@ -5,6 +5,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod concurrency;
 pub mod examples;
 pub mod fault_injection;
 pub mod fuzzing;

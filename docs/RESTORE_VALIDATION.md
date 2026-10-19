@@ -33,7 +33,8 @@ If `./scripts/validate-restore.sh` reports failures, maintainers should interpre
 
 | Failure Type | Interpretation | Escalation Step |
 | --- | --- | --- |
-| **Missing Records** | Core state is incomplete. The restore may have failed midway, or the snapshot was truncated. | Escalate to **Tier 2 Support**. Do not resume operations. Restore from a known-good backup or run data backfill tools. |
-| **Orphaned Records** | The relationship links are broken, often due to out-of-order data insertion during migration. | Run relational backfill scripts. If unresolved, escalate to the **Database Administration Team**. |
+| **Missing Records** | Core state is incomplete. The restore may have failed midway, or the snapshot was truncated. | Escalate to **Tier 2 Support**. Do not resume operations. Restore from a known-good backup or run the [Backfill Tool](BACKFILL_TOOL.md): `./scripts/backfill.sh --module <mod> --input <file>`. |
+| **Orphaned Records** | The relationship links are broken, often due to out-of-order data insertion during migration. | Run relational backfill via the [Backfill Tool](BACKFILL_TOOL.md): `./scripts/backfill.sh --module referral --input <file>`. If unresolved, escalate to the **Database Administration Team**. |
 | **Duplicated Records** | Idempotency or uniqueness constraints have been violated, typically due to duplicated side-effects. | **Halt all trading.** Identify the duplicated side effects. Manual deduplication is required by the **Protocol Engineering Team**. |
 | **Inconsistent Records**| Aggregate values have drifted from the underlying records, possibly due to a logic bug during migration. | Escalate immediately to the **Security and Protocol Engineering Teams**. Do not resume operations until consistency is manually verified and corrected. |
+

@@ -47,7 +47,7 @@ check_missing_records() {
   if [ $missing -eq 0 ]; then
     record "records:missing" 0 ""
   else
-    record "records:missing" 1 "Found missing core records. Review migration logs or restore from older backup."
+    record "records:missing" 1 "Found missing core records. Run backfill tool: ./scripts/backfill.sh --module <mod> --input <file>"
   fi
 }
 
@@ -59,7 +59,7 @@ check_orphaned_records() {
   if [ $orphaned -eq 0 ]; then
     record "records:orphaned" 0 ""
   else
-    record "records:orphaned" 1 "Found orphaned records. Re-run relational backfill script."
+    record "records:orphaned" 1 "Found orphaned records. Run relational backfill: ./scripts/backfill.sh --module referral --input <file>"
   fi
 }
 

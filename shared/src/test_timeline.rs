@@ -40,6 +40,7 @@ impl DummyTimelineContract {
 // Fixture
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Ctx {
     env: Env,
     id: Address,

@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `shared::policy_preview`: Policy simulation preview framework for previewing affected records and users, expected operational side effects, and rollback constraints before committing irreversible or high-impact changes across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules (#250); see `docs/POLICY_SIMULATION_PREVIEW.md`
+- `shared::degradation`: External dependency degradation matrix with failure mode classification, tiered degradation levels (`Nominal`, `DegradedMinor`, `DegradedMajor`, `CriticalFailure`), user-safe fallback behavior (`FallbackStrategy`, `FallbackDecision`), automated checks, and recovery receipts across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules (#231); see `docs/EXTERNAL_DEPENDENCY_DEGRADATION_MATRIX.md`
+- `shared::export`: Permission-aware export pipeline with bounded memory chunking, in-flight cancellation, multi-module role authorization (Treasury, Aid, Referral, Governance, Oracle, Marketplace), forbidden field purging, and cumulative SHA-256 stream digests; see `docs/EXPORT_PIPELINE.md`
+- `shared::audit_ledger`: an append-only, hash-chained ledger for privileged and financial events (roles, config, upgrades, pause/unpause, treasury/aid/escrow/referral/governance/oracle/marketplace value movement) with on-chain `verify_chain`, permissioned bounded `export_ledger`, storage-free `verify_export`, a publishable head-checkpoint event, and tamper-detection tests (#233); see `docs/AUDIT_LEDGER.md`
+- `shared::operational_metadata`: Data minimization review and retention enforcement for operational metadata across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules with classification, redundant field pruning, two-phase testable deletion, hold management, and migration adapters (#229); see `docs/OPERATIONAL_METADATA_RETENTION.md`
 - Two-step ownership transfer with pending acceptance and expiry in `shared::auth` and `contracts/access-control`, requiring explicit cryptographic acceptance by the target owner, supporting automatic expiry rejection, and allowing cancellation before acceptance (#150); see `docs/ACCESS_CONTROL.md`
 - `shared::lifecycle_events`: a canonical, versioned event envelope (`("lifecycle", resource, transition)` with schema version, resource ID, from/to state, actor, and timestamp) for every lifecycle transition, plus an ordered-sequence assertion harness (`testing::lifecycle_events`) that fails tests when an expected event is missing or reordered (#144); see `docs/LIFECYCLE_EVENTS.md`
 - `shared::disclosure`: progressive disclosure of transaction detail fields, where a `Critical`-severity field can never end up reachable only through the advanced/expanded view (#125)
@@ -27,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated CI workflow to include WASM size measurement step
 
 ### Fixed
+- Restored `shared/src/lib.rs`, which was truncated mid-file with a malformed `no_std` attribute, invalid module declarations, and duplicate re-exports, so the `shared` crate (and everything depending on it) could not compile. The module list and re-exports were reconstructed from the last intact revision plus the newer `release_readiness` module, and several latent compile errors in `shared` (over-long `symbol_short!` values, unencodable `Option<user-defined type>` contract fields, missing imports, duplicate `ensure_supported_version`/`is_supported_version` re-exports) were corrected without changing public behavior.
 - `shared`'s `health`, `reconciliation`, and `telemetry` modules were re-exported (`pub use health::{...}` etc.) without a matching `mod` declaration in `shared/src/lib.rs` — an unresolved-module compile error for the whole workspace. Added the three missing `pub mod` declarations.
 
 ---

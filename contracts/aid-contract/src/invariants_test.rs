@@ -2,12 +2,20 @@
 //!
 //! Explicit mathematical invariant proofs proving that humanitarian aid assets
 //! cannot be created, lost, or misallocated across any supported protocol transitions:
+//!
+//! ## Threat Model: Cross-Boundary Trust Decisions
+//!
+//! See `docs/threat-model-aid-contract.md` for the full scenario-based threat model.
+//! The tests below exercise the highest-risk trust boundaries:
+//!
 //! - Aid disbursement creation (escrow funding)
 //! - Recipient aid claiming (settlement)
 //! - Expired aid refund (cancellation)
 //! - Multi-party concurrent aid disbursements
 //! - Failure & rejection paths (reversion invariance)
 //! - Fixture mutations (negative proofs detecting impossible balances)
+//! - Cross-boundary authorization (admin/treasury/donor/recipient)
+//! - Replay & double-spend resistance across status transitions
 
 #![cfg(test)]
 
@@ -114,6 +122,10 @@ impl AidTestFixture {
 // ---------------------------------------------------------------------------
 // 1. Aid Creation (Deposit / Escrow) Invariant Tests
 // ---------------------------------------------------------------------------
+//
+// Trust boundary: donor -> contract escrow.
+// Abuse case: donor funds aid but contract does not record matching liability.
+// Mitigation: escrow transfer and liability write occur atomically in create_aid.
 
 #[test]
 fn test_invariant_create_aid_conserves_assets() {
@@ -155,6 +167,10 @@ fn test_invariant_create_aid_conserves_assets() {
 // ---------------------------------------------------------------------------
 // 2. Aid Claiming (Settlement) Invariant Tests
 // ---------------------------------------------------------------------------
+//
+// Trust boundary: contract escrow -> recipient.
+// Abuse case: non-recipient claims, or recipient double-claims same aid.
+// Mitigation: recipient auth + Pending->Claimed status transition is atomic.
 
 #[test]
 fn test_invariant_claim_aid_settlement_conserves_assets() {
@@ -195,6 +211,10 @@ fn test_invariant_claim_aid_settlement_conserves_assets() {
 // ---------------------------------------------------------------------------
 // 3. Aid Refund (Cancellation on Expiry) Invariant Tests
 // ---------------------------------------------------------------------------
+//
+// Trust boundary: contract escrow -> donor (refund path).
+// Abuse case: premature refund drains escrow before recipient can claim.
+// Mitigation: refund requires ledger sequence strictly past expiry_ledger.
 
 #[test]
 fn test_invariant_refund_aid_cancellation_conserves_assets() {
@@ -238,6 +258,10 @@ fn test_invariant_refund_aid_cancellation_conserves_assets() {
 // ---------------------------------------------------------------------------
 // 4. Concurrent Multi-Disbursement Invariant Tests
 // ---------------------------------------------------------------------------
+//
+// Trust boundary: multiple donors/recipients sharing one contract reserve.
+// Abuse case: interleaved claim/refund corrupts per-aid liability accounting.
+// Mitigation: each aid_id is independently tracked; reserve == sum(liabilities).
 
 #[test]
 fn test_invariant_concurrent_multi_aid_disbursements() {
@@ -305,6 +329,11 @@ fn test_invariant_concurrent_multi_aid_disbursements() {
 // ---------------------------------------------------------------------------
 // 5. Failure Paths (Reversion Invariance)
 // ---------------------------------------------------------------------------
+//
+// Trust boundary: any caller attempting an unauthorized or invalid transition.
+// Abuse case: partial state mutation on rejected call (e.g. reserve drained
+//            before auth check fails).
+// Mitigation: all validation precedes state mutation; failures revert cleanly.
 
 #[test]
 fn test_invariant_aid_failure_paths_preserve_exact_state() {
@@ -346,6 +375,10 @@ fn test_invariant_aid_failure_paths_preserve_exact_state() {
 // ---------------------------------------------------------------------------
 // 6. Mutation Testing (Proving Tests Fail on Impossible Balances)
 // ---------------------------------------------------------------------------
+//
+// Trust boundary: the invariant checker itself.
+// Abuse case: a buggy invariant that silently accepts corrupted snapshots.
+// Mitigation: mutation tests inject impossible states and assert detection.
 
 #[test]
 fn test_mutation_impossible_balances_fail_invariant_verification() {
@@ -402,4 +435,287 @@ fn test_mutation_impossible_balances_fail_invariant_verification() {
         }
         other => panic!("Expected ImpossibleBalanceDetected, got {:?}", other),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Cross-Boundary Authorization Threat Scenarios
+// ---------------------------------------------------------------------------
+//
+// These tests cover the highest-risk trust boundaries identified in the
+// scenario-based threat model (see docs/threat-model-aid-contract.md).
+
+#[test]
+fn test_threat_unauthorized_admin_cannot_reinitialize() {
+    let fx = setup_aid_fixture();
+    let attacker = Address::generate(&fx.env);
+
+    // Abuse case: attacker attempts to re-initialize the contract to hijack
+    // admin/treasury/token. Must fail and leave state unchanged.
+    let res = fx.client.try_initialize(
+        &attacker,
+        &attacker,
+        &fx.token_addr,
+        &86400,
+    );
+    assert!(res.is_err(), "re-initialize must be rejected");
+
+    // Verify original admin still controls the contract by creating an aid.
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &1_000,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+    assert!(fx.client.get_aid(&aid_id).is_some());
+}
+
+#[test]
+fn test_threat_double_claim_rejected_and_conserves_assets() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &12_000,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+    aid_ids.push(aid_id);
+
+    // First claim succeeds.
+    fx.client.claim_aid(&aid_id, &fx.recipient_1);
+    let after_first = fx.capture_snapshot(&aid_ids);
+
+    // Abuse case: replay the same claim. Must revert with no state change.
+    let replay = fx.client.try_claim_aid(&aid_id, &fx.recipient_1);
+    assert!(replay.is_err(), "double claim must be rejected");
+
+    let after_replay = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&after_first, &after_replay);
+    assert_eq!(after_replay.contract_token_reserve, 0);
+    assert_eq!(after_replay.internal_liabilities, 0);
+}
+
+#[test]
+fn test_threat_claim_after_refund_rejected() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    let expiry_ledger = fx.env.ledger().sequence() + 10;
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &8_000,
+        &expiry_ledger,
+        &None,
+    );
+    aid_ids.push(aid_id);
+
+    // Advance past expiry and refund to donor.
+    fx.env.ledger().set_sequence_number(expiry_ledger + 1);
+    fx.client.refund_aid(&aid_id, &fx.donor);
+    let after_refund = fx.capture_snapshot(&aid_ids);
+
+    // Abuse case: recipient races the refund and tries to claim afterwards.
+    let late_claim = fx.client.try_claim_aid(&aid_id, &fx.recipient_1);
+    assert!(late_claim.is_err(), "claim after refund must be rejected");
+
+    let after_late = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&after_refund, &after_late);
+}
+
+#[test]
+fn test_threat_refund_after_claim_rejected() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    let expiry_ledger = fx.env.ledger().sequence() + 10;
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &9_000,
+        &expiry_ledger,
+        &None,
+    );
+    aid_ids.push(aid_id);
+
+    // Recipient claims before expiry.
+    fx.client.claim_aid(&aid_id, &fx.recipient_1);
+    let after_claim = fx.capture_snapshot(&aid_ids);
+
+    // Abuse case: donor attempts to refund an already-claimed aid.
+    fx.env.ledger().set_sequence_number(expiry_ledger + 1);
+    let late_refund = fx.client.try_refund_aid(&aid_id, &fx.donor);
+    assert!(late_refund.is_err(), "refund after claim must be rejected");
+
+    let after_late = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&after_claim, &after_late);
+}
+
+#[test]
+fn test_threat_unauthorized_refund_by_non_donor_rejected() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    let expiry_ledger = fx.env.ledger().sequence() + 10;
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &7_500,
+        &expiry_ledger,
+        &None,
+    );
+    aid_ids.push(aid_id);
+
+    let baseline = fx.capture_snapshot(&aid_ids);
+
+    // Advance past expiry so the only remaining check is authorization.
+    fx.env.ledger().set_sequence_number(expiry_ledger + 1);
+
+    // Abuse case: a third party (recipient_2) attempts to trigger refund.
+    let res = fx.client.try_refund_aid(&aid_id, &fx.recipient_2);
+    assert!(res.is_err(), "non-donor refund must be rejected");
+
+    let after = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&baseline, &after);
+    assert_eq!(after.contract_token_reserve, 7_500);
+    assert_eq!(after.internal_liabilities, 7_500);
+}
+
+#[test]
+fn test_threat_zero_and_negative_amount_rejected() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+    let baseline = fx.capture_snapshot(&aid_ids);
+    let expiry_ledger = fx.env.ledger().sequence() + 100;
+
+    // Abuse case: zero-amount aid could bypass liability checks.
+    let zero = fx.client.try_create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &0,
+        &expiry_ledger,
+        &None,
+    );
+    assert!(zero.is_err(), "zero-amount aid must be rejected");
+
+    // Abuse case: negative amount could invert escrow direction.
+    let negative = fx.client.try_create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &-1_000,
+        &expiry_ledger,
+        &None,
+    );
+    assert!(negative.is_err(), "negative-amount aid must be rejected");
+
+    let after = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&baseline, &after);
+}
+
+#[test]
+fn test_threat_expired_aid_cannot_be_claimed() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    let expiry_ledger = fx.env.ledger().sequence() + 5;
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &6_000,
+        &expiry_ledger,
+        &None,
+    );
+    aid_ids.push(aid_id);
+
+    let baseline = fx.capture_snapshot(&aid_ids);
+
+    // Advance strictly past expiry.
+    fx.env.ledger().set_sequence_number(expiry_ledger + 1);
+
+    // Abuse case: recipient attempts to claim after expiry window.
+    let res = fx.client.try_claim_aid(&aid_id, &fx.recipient_1);
+    assert!(res.is_err(), "expired aid claim must be rejected");
+
+    let after = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&baseline, &after);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Operational Edge Cases & Recovery Invariants
+// ---------------------------------------------------------------------------
+//
+// These tests document failure modes and rollback/recovery expectations for
+// operational incidents. See docs/threat-model-aid-contract.md for the
+// corresponding runbook.
+
+#[test]
+fn test_recovery_partial_batch_failure_leaves_consistent_state() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    // Successful aid.
+    let good = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &5_000,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+    aid_ids.push(good);
+
+    let after_good = fx.capture_snapshot(&aid_ids);
+
+    // Failing aid (zero amount) must not disturb the successful one.
+    let bad = fx.client.try_create_aid(
+        &fx.donor,
+        &fx.recipient_2,
+        &0,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+    assert!(bad.is_err());
+
+    let after_bad = fx.capture_snapshot(&aid_ids);
+    assert_reversion_invariance(&after_good, &after_bad);
+    assert_eq!(after_bad.contract_token_reserve, 5_000);
+    assert_eq!(after_bad.internal_liabilities, 5_000);
+}
+
+#[test]
+fn test_recovery_after_full_drain_contract_accepts_new_aid() {
+    let fx = setup_aid_fixture();
+    let mut aid_ids = Vec::new();
+
+    // Create and fully settle one aid.
+    let aid_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_1,
+        &4_000,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+    aid_ids.push(aid_id);
+    fx.client.claim_aid(&aid_id, &fx.recipient_1);
+
+    let drained = fx.capture_snapshot(&aid_ids);
+    assert_eq!(drained.contract_token_reserve, 0);
+    assert_eq!(drained.internal_liabilities, 0);
+
+    // Recovery: contract must accept new aid after full drain.
+    let new_id = fx.client.create_aid(
+        &fx.donor,
+        &fx.recipient_2,
+        &3_000,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+    aid_ids.push(new_id);
+
+    let after = fx.capture_snapshot(&aid_ids);
+    assert_asset_conservation(&drained, &after);
+    assert_eq!(after.contract_token_reserve, 3_000);
+    assert_eq!(after.internal_liabilities, 3_000);
 }

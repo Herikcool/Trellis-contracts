@@ -568,6 +568,63 @@ pub fn emit_upgrade_rolled_back(
     );
 }
 
+/// Emits `ReleaseReadinessEvaluated`.
+///
+/// Topics: `("readiness", "evaluated", correlation_id)`
+///
+/// Data: `(release_version, is_ready, passed, failed, missing_gates, timestamp)`
+pub fn emit_release_readiness_evaluated(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    release_version: Symbol,
+    is_ready: bool,
+    passed: u32,
+    failed: u32,
+    missing_gates: u32,
+    timestamp: u64,
+) {
+    env.events().publish(
+        (
+            symbol_short!("readiness"),
+            symbol_short!("evaluated"),
+            correlation_id.clone(),
+        ),
+        (release_version, is_ready, passed, failed, missing_gates, timestamp),
+    );
+}
+
+/// Emits `RollbackRehearsalExecuted`.
+///
+/// Topics: `("rollback", "rehearse", correlation_id)`
+///
+/// Data: `(rehearsal_id, module_id, from_version, restored_version, passed, timestamp)`
+pub fn emit_rollback_rehearsal_executed(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    rehearsal_id: u64,
+    module_id: u32,
+    from_version: u32,
+    restored_version: u32,
+    passed: bool,
+    timestamp: u64,
+) {
+    env.events().publish(
+        (
+            symbol_short!("rollback"),
+            symbol_short!("rehearse"),
+            correlation_id.clone(),
+        ),
+        (
+            rehearsal_id,
+            module_id,
+            from_version,
+            restored_version,
+            passed,
+            timestamp,
+        ),
+    );
+}
+
 /// Emits `RoleGranted`.
 ///
 /// Topics: `("role", "granted")`

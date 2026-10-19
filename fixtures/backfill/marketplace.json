@@ -1,0 +1,18 @@
+[
+  {
+    "collection_id": 1,
+    "name": "Trellis Aid Badges",
+    "symbol": "TAB",
+    "owner": "GBV7F3X3QJ7L6G5U2R7V6Q5U2R7V6Q5U2R7V6Q5U2R7V6Q5U2R7V6Q5U",
+    "royalty_bps": 500,
+    "metadata_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "collection_id": 2,
+    "name": "Disaster Relief Donors",
+    "symbol": "DRD",
+    "owner": "GDG44Y6F7NKGXW2H3PZ4Y6F7NKGXW2H3PZ4Y6F7NKGXW2H3PZ4Y6F7N",
+    "royalty_bps": 250,
+    "metadata_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+  }
+]

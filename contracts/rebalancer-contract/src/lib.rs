@@ -9,7 +9,54 @@ pub use fee_calculator::calculate_total_fees;
 pub use logging::log_trade;
 use shared::events::emit_action_executed;
 pub use slippage_predictor::predict_slippage;
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol, Vec, U256};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    U256,
+};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeCapacity {
+    pub max_trade_amount: u128,
+    pub max_slippage_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+enum StorageKey {
+    Admin,
+    Capacity(Symbol, Symbol),
+}
+
+#[contracterror]
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RebalancerError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    InvalidCapacity = 4,
+}
+
+pub(crate) fn trade_capacity(env: &Env, pair: &(Symbol, Symbol)) -> Option<TradeCapacity> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::Capacity(pair.0.clone(), pair.1.clone()))
+}
+
+pub(crate) fn capacity_allows(
+    env: &Env,
+    pair: &(Symbol, Symbol),
+    amount: u128,
+    slippage_bps: u128,
+) -> bool {
+    trade_capacity(env, pair)
+        .map(|capacity| {
+            amount <= capacity.max_trade_amount
+                && slippage_bps <= u128::from(capacity.max_slippage_bps)
+        })
+        .unwrap_or(false)
+}
 pub use strategy_executor::execute_strategy;
 
 #[contracttype]
@@ -73,6 +120,49 @@ pub struct MultiAssetRebalancer;
 
 #[contractimpl]
 impl MultiAssetRebalancer {
+    /// Set the account that is allowed to configure pair-specific limits.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), RebalancerError> {
+        if env.storage().instance().has(&StorageKey::Admin) {
+            return Err(RebalancerError::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        Ok(())
+    }
+
+    /// Configure the maximum amount and tolerated predicted slippage for a
+    /// directed asset pair. Set limits from current pool depth and governance
+    /// policy; unconfigured pairs are rejected by the executor.
+    pub fn set_pair_capacity(
+        env: Env,
+        admin: Address,
+        asset_in: Symbol,
+        asset_out: Symbol,
+        max_trade_amount: u128,
+        max_slippage_bps: u32,
+    ) -> Result<(), RebalancerError> {
+        let configured_admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        let Some(configured_admin) = configured_admin else {
+            return Err(RebalancerError::NotInitialized);
+        };
+        if admin != configured_admin {
+            return Err(RebalancerError::Unauthorized);
+        }
+        admin.require_auth();
+        if asset_in == asset_out || max_trade_amount == 0 || max_slippage_bps > 10_000 {
+            return Err(RebalancerError::InvalidCapacity);
+        }
+
+        let capacity = TradeCapacity {
+            max_trade_amount,
+            max_slippage_bps,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::Capacity(asset_in, asset_out), &capacity);
+        Ok(())
+    }
+
     pub fn rebalance(
         env: Env,
         trades: Vec<Trade>,
@@ -90,13 +180,33 @@ impl MultiAssetRebalancer {
                 total_slippage = total_slippage.saturating_add(slippage_val);
 
                 let (status, fee, error_code) = if trade.amount == 0 {
-                    (TradeStatus::Failed, 0, Some(strategy_executor::ERROR_ZERO_AMOUNT))
+                    (
+                        TradeStatus::Failed,
+                        0,
+                        Some(strategy_executor::ERROR_ZERO_AMOUNT),
+                    )
                 } else if trade.asset_pair.0 == trade.asset_pair.1 {
-                    (TradeStatus::Failed, 0, Some(strategy_executor::ERROR_IDENTICAL_ASSETS))
+                    (
+                        TradeStatus::Failed,
+                        0,
+                        Some(strategy_executor::ERROR_IDENTICAL_ASSETS),
+                    )
                 } else if trade.amount > 10_000_000_000 {
-                    (TradeStatus::Failed, 0, Some(strategy_executor::ERROR_EXCEEDS_CAPACITY))
+                    (
+                        TradeStatus::Failed,
+                        0,
+                        Some(strategy_executor::ERROR_EXCEEDS_CAPACITY),
+                    )
                 } else {
-                    (TradeStatus::Success, trade.amount / 1000, None)
+                    (
+                        TradeStatus::Success,
+                        fee_calculator::fee_for_amount(
+                            trade.amount,
+                            fee_calculator::DEFAULT_FEE_BPS,
+                        )
+                        .expect("the default fee rate is valid"),
+                        None,
+                    )
                 };
 
                 trade_statuses.push_back(TradeReceipt {

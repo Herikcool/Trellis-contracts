@@ -29,7 +29,10 @@
 //! - [`TreasuryContract::withdrawal_limit`]: View the max per-transaction limit
 //! - [`TreasuryContract::referral_contract`]: See the registered referral contract
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, Symbol};
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, IntoVal, Symbol, Vec,
+};
 
 use shared::auth::{self, Permission, Role};
 use shared::errors::Error;
@@ -56,6 +59,42 @@ const REFERRAL_CONTRACT: Symbol = symbol_short!("ref_ctr");
 /// Storage key prefix for scheduled-action time windows; full key is
 /// `(SCHEDULE, action_id)`.
 const SCHEDULE: Symbol = symbol_short!("sched");
+const VELOCITY_WINDOW: Symbol = symbol_short!("vel_wnd");
+const VELOCITY_MAX: Symbol = symbol_short!("vel_max");
+const VELOCITY_STATE: Symbol = symbol_short!("vel_state");
+const STRATEGY_APPROVED: Symbol = symbol_short!("strat_ok");
+const STRATEGY_LIST: Symbol = symbol_short!("strat_lst");
+const STRATEGY_CAP: Symbol = symbol_short!("strat_cap");
+const STRATEGY_POSITION: Symbol = symbol_short!("strat_pos");
+const STRATEGY_TOTAL: Symbol = symbol_short!("strat_tot");
+const STRATEGY_YIELD_CATEGORY: Symbol = symbol_short!("yield");
+const MAX_STRATEGY_ALLOCATION_BPS: u32 = 3_000;
+
+#[contractclient(name = "ReserveStrategyClient")]
+pub trait ReserveStrategy {
+    fn deposit_reserve(env: Env, token: Address, amount: i128) -> Result<(), Error>;
+    fn withdraw_reserve(env: Env, token: Address, recipient: Address, amount: i128)
+        -> Result<i128, Error>;
+    fn harvest_yield(env: Env, token: Address, recipient: Address) -> Result<i128, Error>;
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityStatus {
+    pub window_start: u64,
+    pub cumulative_outflow: i128,
+    pub window_size_seconds: u64,
+    pub max_window_outflow: i128,
+    pub paused: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VelocityState {
+    window_start: u64,
+    cumulative_outflow: i128,
+    active: bool,
+}
 
 /// A time window during which a scheduled action may execute.
 ///
@@ -179,6 +218,7 @@ impl TreasuryContract {
             &true,
         );
         instance_set(&env, &MAX_WD, &max_withdrawal_limit);
+        instance_set(&env, &STRATEGY_CAP, &MAX_STRATEGY_ALLOCATION_BPS);
         record_treasury_audit(
             &env,
             &admin,
@@ -286,6 +326,133 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Configure a per-token rolling outflow window. Admin only.
+    pub fn set_velocity_limit(
+        env: Env,
+        caller: Address,
+        window_size_seconds: u64,
+        max_window_outflow: i128,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        if window_size_seconds == 0 || max_window_outflow <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        instance_set(&env, &VELOCITY_WINDOW, &window_size_seconds);
+        instance_set(&env, &VELOCITY_MAX, &max_window_outflow);
+        emit_action_executed(
+            &env,
+            &zero_correlation_id(&env),
+            symbol_short!("treasury"),
+            symbol_short!("vel_cfg"),
+            &caller,
+            true,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Return the configured rolling-window state for a token.
+    pub fn velocity_status(env: Env, token: Address) -> VelocityStatus {
+        let state = current_velocity_state(&env, &token);
+        let maximum = instance_get(&env, &VELOCITY_MAX).unwrap_or(0);
+        VelocityStatus {
+            window_start: state.window_start,
+            cumulative_outflow: state.cumulative_outflow,
+            window_size_seconds: instance_get(&env, &VELOCITY_WINDOW).unwrap_or(0),
+            max_window_outflow: maximum,
+            paused: maximum > 0 && state.cumulative_outflow >= maximum,
+        }
+    }
+
+    /// Approve a reserve strategy adapter. Admin only.
+    pub fn approve_reserve_strategy(
+        env: Env,
+        caller: Address,
+        strategy: Address,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        let approval_key = (STRATEGY_APPROVED, strategy.clone());
+        if instance_get::<_, bool>(&env, &approval_key).unwrap_or(false) {
+            return Err(Error::InvalidArgument);
+        }
+        instance_set(&env, &approval_key, &true);
+        let mut strategies: Vec<Address> =
+            instance_get(&env, &STRATEGY_LIST).unwrap_or(Vec::new(&env));
+        strategies.push_back(strategy.clone());
+        instance_set(&env, &STRATEGY_LIST, &strategies);
+        emit_action_executed(
+            &env,
+            &zero_correlation_id(&env),
+            symbol_short!("treasury"),
+            symbol_short!("strat_add"),
+            &caller,
+            true,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Revoke an unused reserve strategy adapter. Admin only.
+    pub fn revoke_reserve_strategy(
+        env: Env,
+        caller: Address,
+        strategy: Address,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        let total_key = (STRATEGY_TOTAL, strategy.clone());
+        if instance_get::<_, i128>(&env, &total_key).unwrap_or(0) != 0 {
+            return Err(Error::InsufficientBalance);
+        }
+        let approval_key = (STRATEGY_APPROVED, strategy.clone());
+        if !instance_get::<_, bool>(&env, &approval_key).unwrap_or(false) {
+            return Err(Error::NotFound);
+        }
+        env.storage().instance().remove(&approval_key);
+        let mut strategies: Vec<Address> =
+            instance_get(&env, &STRATEGY_LIST).unwrap_or(Vec::new(&env));
+        let mut index = 0;
+        while index < strategies.len() {
+            if strategies.get(index).unwrap() == strategy {
+                strategies.remove(index);
+                break;
+            }
+            index += 1;
+        }
+        instance_set(&env, &STRATEGY_LIST, &strategies);
+        emit_action_executed(
+            &env,
+            &zero_correlation_id(&env),
+            symbol_short!("treasury"),
+            symbol_short!("strat_del"),
+            &caller,
+            true,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Set the reserve allocation cap, no greater than 30% of a category.
+    pub fn set_strategy_allocation_cap(
+        env: Env,
+        caller: Address,
+        cap_bps: u32,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        if cap_bps > MAX_STRATEGY_ALLOCATION_BPS {
+            return Err(Error::InvalidArgument);
+        }
+        instance_set(&env, &STRATEGY_CAP, &cap_bps);
+        Ok(())
+    }
+
+    pub fn strategy_allocation_cap(env: Env) -> u32 {
+        instance_get(&env, &STRATEGY_CAP).unwrap_or(MAX_STRATEGY_ALLOCATION_BPS)
+    }
+
+    pub fn reserve_strategies(env: Env) -> Vec<Address> {
+        instance_get(&env, &STRATEGY_LIST).unwrap_or(Vec::new(&env))
+    }
+
     /// Credits `amount` into `category`'s balance for `token`. `TreasuryManager` only.
     pub fn deposit(
         env: Env,
@@ -338,6 +505,131 @@ impl TreasuryContract {
         instance_get::<_, i128>(&env, &(BALANCE, token, category)).unwrap_or(0)
     }
 
+    /// Allocate category reserves to an approved SEP-41 strategy adapter.
+    pub fn allocate_reserve(
+        env: Env,
+        caller: Address,
+        token: Address,
+        category: Symbol,
+        strategy: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        auth::require_permission(&env, &caller, Permission::TreasuryOperations)?;
+        if !strategy_is_approved(&env, &strategy) {
+            return Err(Error::Unauthorized);
+        }
+
+        let balance_key = (BALANCE, token.clone(), category.clone());
+        let category_balance: i128 = instance_get(&env, &balance_key).unwrap_or(0);
+        let cap_bps = Self::strategy_allocation_cap(env.clone());
+        let cap_amount = category_balance
+            .checked_mul(cap_bps as i128)
+            .ok_or(Error::Overflow)?
+            / 10_000;
+        let mut allocated = 0_i128;
+        let strategies = Self::reserve_strategies(env.clone());
+        let mut index = 0;
+        while index < strategies.len() {
+            let adapter = strategies.get(index).unwrap();
+            let position_key = (
+                STRATEGY_POSITION,
+                token.clone(),
+                category.clone(),
+                adapter,
+            );
+            allocated = allocated
+                .checked_add(instance_get::<_, i128>(&env, &position_key).unwrap_or(0))
+                .ok_or(Error::Overflow)?;
+            index += 1;
+        }
+        if amount > category_balance || allocated.checked_add(amount).ok_or(Error::Overflow)? > cap_amount {
+            return Err(Error::InsufficientBalance);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &strategy,
+            &amount,
+        );
+        invoke_strategy_deposit(&env, &strategy, &token, amount)?;
+
+        let position_key = (STRATEGY_POSITION, token.clone(), category, strategy.clone());
+        let position = instance_get::<_, i128>(&env, &position_key).unwrap_or(0);
+        instance_set(&env, &position_key, &position.checked_add(amount).ok_or(Error::Overflow)?);
+        let total_key = (STRATEGY_TOTAL, strategy);
+        let total = instance_get::<_, i128>(&env, &total_key).unwrap_or(0);
+        instance_set(&env, &total_key, &total.checked_add(amount).ok_or(Error::Overflow)?);
+        Ok(())
+    }
+
+    /// Recall strategy yield and record it in the dedicated yield category.
+    pub fn harvest_yield(
+        env: Env,
+        caller: Address,
+        token: Address,
+        strategy: Address,
+    ) -> Result<i128, Error> {
+        auth::require_permission(&env, &caller, Permission::TreasuryOperations)?;
+        if !strategy_is_approved(&env, &strategy) {
+            return Err(Error::Unauthorized);
+        }
+        let token_client = token::Client::new(&env, &token);
+        let before = token_client.balance(&env.current_contract_address());
+        let earned = invoke_strategy_harvest(&env, &strategy, &token)?;
+        if earned <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let received = token_client
+            .balance(&env.current_contract_address())
+            .checked_sub(before)
+            .ok_or(Error::Overflow)?;
+        if received != earned {
+            return Err(Error::InsufficientBalance);
+        }
+
+        let key = (BALANCE, token.clone(), STRATEGY_YIELD_CATEGORY);
+        let balance: i128 = instance_get(&env, &key).unwrap_or(0);
+        let new_balance = balance.checked_add(earned).ok_or(Error::Overflow)?;
+        instance_set(&env, &key, &new_balance);
+        record_treasury_audit(
+            &env,
+            &caller,
+            TimelineEventType::RecordUpdated,
+            symbol_short!("harvest"),
+            symbol_short!("yield_in"),
+            Some(token.clone()),
+            Some(STRATEGY_YIELD_CATEGORY),
+            Some(balance),
+            Some(new_balance),
+        )?;
+        emit_treasury_deposit(
+            &env,
+            &zero_correlation_id(&env),
+            STRATEGY_YIELD_CATEGORY,
+            &caller,
+            &token,
+            earned,
+            new_balance,
+        );
+        Ok(earned)
+    }
+
+    pub fn strategy_position(
+        env: Env,
+        token: Address,
+        category: Symbol,
+        strategy: Address,
+    ) -> i128 {
+        instance_get(
+            &env,
+            &(STRATEGY_POSITION, token, category, strategy),
+        )
+        .unwrap_or(0)
+    }
+
     /// Returns the currently configured max per-transaction withdrawal limit.
     pub fn withdrawal_limit(env: Env) -> i128 {
         instance_get::<_, i128>(&env, &MAX_WD).unwrap_or(0)
@@ -379,6 +671,9 @@ impl TreasuryContract {
 
         // Auth check last
         auth::require_permission(&env, &caller, Permission::TreasuryOperations)?;
+
+        ensure_strategy_liquidity(&env, &token, &category, amount)?;
+        check_and_record_outflow(&env, &token, amount)?;
 
         // Quota enforcement: fail-open when unconfigured.
         shared::quota::check_and_consume(&env, &caller, &symbol_short!("wdraw"), amount)?;
@@ -495,6 +790,8 @@ impl TreasuryContract {
         if amount > balance {
             return Err(Error::InsufficientBalance);
         }
+        ensure_strategy_liquidity(&env, &token, &category, amount)?;
+        check_and_record_outflow(&env, &token, amount)?;
         shared::quota::check_and_consume(&env, &caller, &symbol_short!("wdraw"), amount)?;
 
         let remaining = balance - amount;
@@ -564,6 +861,8 @@ impl TreasuryContract {
 
         // Auth check last
         auth::require_admin(&env, &caller)?;
+        ensure_strategy_liquidity(&env, &token, &RESERVE_CATEGORY, amount)?;
+        check_and_record_outflow(&env, &token, amount)?;
         instance_set(&env, &key, &new_balance);
         record_treasury_audit(
             &env,
@@ -662,6 +961,8 @@ impl TreasuryContract {
         let referral_contract: Address =
             instance_get(&env, &REFERRAL_CONTRACT).ok_or(Error::Unauthorized)?;
         auth::require_permission(&env, &referral_contract, Permission::ServiceOperation)?;
+        ensure_strategy_liquidity(&env, &token, &REWARDS_CATEGORY, amount)?;
+        check_and_record_outflow(&env, &token, amount)?;
 
         let remaining = balance - amount;
         instance_set(&env, &key, &remaining);
@@ -754,6 +1055,181 @@ impl TreasuryContract {
         )?;
         Ok(())
     }
+}
+
+fn current_velocity_state(env: &Env, token: &Address) -> VelocityState {
+    let state_key = (VELOCITY_STATE, token.clone());
+    let state: VelocityState = instance_get(env, &state_key).unwrap_or(VelocityState {
+        window_start: env.ledger().timestamp(),
+        cumulative_outflow: 0,
+        active: false,
+    });
+    let window_size = instance_get::<_, u64>(env, &VELOCITY_WINDOW).unwrap_or(0);
+    if state.active
+        && window_size > 0
+        && env.ledger().timestamp() >= state.window_start.saturating_add(window_size)
+    {
+        VelocityState {
+            window_start: env.ledger().timestamp(),
+            cumulative_outflow: 0,
+            active: false,
+        }
+    } else {
+        state
+    }
+}
+
+fn check_and_record_outflow(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+    let window_size = instance_get::<_, u64>(env, &VELOCITY_WINDOW).unwrap_or(0);
+    let maximum = instance_get::<_, i128>(env, &VELOCITY_MAX).unwrap_or(0);
+    if window_size == 0 || maximum <= 0 {
+        return Ok(());
+    }
+
+    let mut state = current_velocity_state(env, token);
+    if state.cumulative_outflow >= maximum {
+        return Err(Error::OperationPaused);
+    }
+    let next_outflow = state
+        .cumulative_outflow
+        .checked_add(amount)
+        .ok_or(Error::Overflow)?;
+    if next_outflow > maximum {
+        return Err(Error::QuotaExceeded);
+    }
+
+    state.cumulative_outflow = next_outflow;
+    state.active = true;
+    let state_key = (VELOCITY_STATE, token.clone());
+    instance_set(env, &state_key, &state);
+    if next_outflow == maximum {
+        env.events().publish(
+            (symbol_short!("treasury"), symbol_short!("vel_trip"), token.clone()),
+            (state.window_start, next_outflow, maximum, env.ledger().timestamp()),
+        );
+    }
+    Ok(())
+}
+
+fn strategy_is_approved(env: &Env, strategy: &Address) -> bool {
+    instance_get(env, &(STRATEGY_APPROVED, strategy.clone())).unwrap_or(false)
+}
+
+fn invoke_strategy_deposit(
+    env: &Env,
+    strategy: &Address,
+    token: &Address,
+    amount: i128,
+) -> Result<(), Error> {
+    let function = Symbol::new(env, "deposit_reserve");
+    match env.try_invoke_contract::<(), Error>(
+        strategy,
+        &function,
+        (token.clone(), amount).into_val(env),
+    ) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) | Err(Ok(error)) => Err(error),
+        Err(Err(_)) => Err(Error::InvalidArgument),
+    }
+}
+
+fn invoke_strategy_withdraw(
+    env: &Env,
+    strategy: &Address,
+    token: &Address,
+    recipient: &Address,
+    amount: i128,
+) -> Result<i128, Error> {
+    let function = Symbol::new(env, "withdraw_reserve");
+    match env.try_invoke_contract::<i128, Error>(
+        strategy,
+        &function,
+        (token.clone(), recipient.clone(), amount).into_val(env),
+    ) {
+        Ok(Ok(received)) => Ok(received),
+        Ok(Err(error)) | Err(Ok(error)) => Err(error),
+        Err(Err(_)) => Err(Error::InvalidArgument),
+    }
+}
+
+fn invoke_strategy_harvest(
+    env: &Env,
+    strategy: &Address,
+    token: &Address,
+) -> Result<i128, Error> {
+    let function = Symbol::new(env, "harvest_yield");
+    match env.try_invoke_contract::<i128, Error>(
+        strategy,
+        &function,
+        (token.clone(), env.current_contract_address()).into_val(env),
+    ) {
+        Ok(Ok(earned)) => Ok(earned),
+        Ok(Err(error)) | Err(Ok(error)) => Err(error),
+        Err(Err(_)) => Err(Error::InvalidArgument),
+    }
+}
+
+fn ensure_strategy_liquidity(
+    env: &Env,
+    token: &Address,
+    category: &Symbol,
+    amount: i128,
+) -> Result<(), Error> {
+    let strategies: Vec<Address> = instance_get(env, &STRATEGY_LIST).unwrap_or(Vec::new(env));
+    let mut has_position = false;
+    let mut i = 0;
+    while i < strategies.len() {
+        let position_key = (
+            STRATEGY_POSITION,
+            token.clone(),
+            category.clone(),
+            strategies.get(i).unwrap(),
+        );
+        if instance_get::<_, i128>(env, &position_key).unwrap_or(0) > 0 {
+            has_position = true;
+            break;
+        }
+        i += 1;
+    }
+    if !has_position {
+        return Ok(());
+    }
+
+    let treasury = env.current_contract_address();
+    let token_client = token::Client::new(env, token);
+    let mut liquid = token_client.balance(&treasury);
+    i = 0;
+    while liquid < amount && i < strategies.len() {
+        let strategy = strategies.get(i).unwrap();
+        let position_key = (
+            STRATEGY_POSITION,
+            token.clone(),
+            category.clone(),
+            strategy.clone(),
+        );
+        let position = instance_get::<_, i128>(env, &position_key).unwrap_or(0);
+        if position > 0 {
+            let requested = position.min(amount - liquid);
+            let received = invoke_strategy_withdraw(env, &strategy, token, &treasury, requested)?;
+            if received <= 0 || received > requested {
+                return Err(Error::InsufficientBalance);
+            }
+            let updated_liquid = token_client.balance(&treasury);
+            if updated_liquid.checked_sub(liquid).ok_or(Error::Overflow)? < received {
+                return Err(Error::InsufficientBalance);
+            }
+            instance_set(env, &position_key, &(position - received));
+            let total_key = (STRATEGY_TOTAL, strategy);
+            let total = instance_get::<_, i128>(env, &total_key).unwrap_or(0);
+            instance_set(env, &total_key, &total.checked_sub(received).ok_or(Error::Overflow)?);
+            liquid = updated_liquid;
+        }
+        i += 1;
+    }
+    if liquid < amount {
+        return Err(Error::InsufficientBalance);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

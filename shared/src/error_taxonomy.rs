@@ -2,6 +2,8 @@ use soroban_sdk::{contracttype, BytesN, Env, String};
 
 use crate::errors::Error;
 
+pub const UNEXPECTED_ERROR_CODE: &str = "UNEXPECTED_ERROR";
+
 /// Contract family used to disambiguate contract-specific numeric error codes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +21,7 @@ pub enum ErrorDomain {
     Marketplace,
     Upgradeability,
     Import,
+    Export,
 }
 
 /// Broad class used by clients to choose safe recovery behavior.
@@ -251,6 +254,13 @@ fn shared_definition(code: u32) -> Option<Definition> {
             false,
             "This record format is not supported by the current service version.",
             Some("Contact a maintainer before retrying this operation."),
+        ),
+        x if x == E::DependencyDegraded as u32 => definition(
+            "DEPENDENCY_DEGRADED",
+            ErrorCategory::Settlement,
+            true,
+            "An external dependency is degraded or unavailable. Safe fallback behavior has been engaged.",
+            Some("Verify dependency status or retry once external services recover."),
         ),
         x if x == E::NotPaused as u32
             || x == E::NoChangeDetected as u32 =>
@@ -633,8 +643,76 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
             ),
             _ => return None,
         }),
+        ErrorDomain::Export => Some(match code {
+            920 | 921 => definition(
+                "UNAUTHORIZED",
+                ErrorCategory::Authorization,
+                false,
+                "You are not authorized to complete this action.",
+                Some("Use an account with export permission or contact a maintainer."),
+            ),
+            922 => definition(
+                "EXPORT_TOO_LARGE",
+                ErrorCategory::Validation,
+                false,
+                "The export exceeds the maximum number of records.",
+                Some("Reduce the requested record count and retry."),
+            ),
+            923 => definition(
+                "EXPORT_INVALID_SCOPE",
+                ErrorCategory::Validation,
+                false,
+                "The requested export scope is invalid.",
+                Some("Choose a supported export scope."),
+            ),
+            924 => definition(
+                "EXPORT_EXPIRED",
+                ErrorCategory::Conflict,
+                false,
+                "This export has expired.",
+                Some("Generate a new export."),
+            ),
+            925 => definition(
+                "EXPORT_TTL_TOO_LONG",
+                ErrorCategory::Validation,
+                false,
+                "The requested export validity window is too long.",
+                Some("Choose a shorter validity window."),
+            ),
+            926 => definition(
+                "UNSUPPORTED_SCHEMA",
+                ErrorCategory::Configuration,
+                false,
+                "This export format is not supported by the current service version.",
+                Some("Contact a maintainer before retrying this operation."),
+            ),
+            927 => definition(
+                "EXPORT_INVALID_REQUEST",
+                ErrorCategory::Validation,
+                false,
+                "The export request contains invalid parameters.",
+                Some("Review the request parameters and submit corrected values."),
+            ),
+            _ => return None,
+        }),
         _ => None,
     }
+}
+
+/// Returns the stable machine code for a raw contract error without needing
+/// an `Env`, so off-chain tooling and docs generators can share the same
+/// taxonomy as on-chain callers.
+pub fn stable_code(domain: ErrorDomain, raw_code: u32) -> &'static str {
+    domain_definition(&domain, raw_code)
+        .or_else(|| shared_definition(raw_code))
+        .map(|details| details.code)
+        .unwrap_or(UNEXPECTED_ERROR_CODE)
+}
+
+/// Returns true when the raw error is part of the documented taxonomy for the
+/// given domain. Used by tests and CI to prevent accidental contract drift.
+pub fn is_documented(domain: ErrorDomain, raw_code: u32) -> bool {
+    domain_definition(&domain, raw_code).is_some() || shared_definition(raw_code).is_some()
 }
 
 /// Converts a raw contract error into a safe, structured response.
@@ -652,7 +730,7 @@ pub fn describe_error(
         .or_else(|| shared_definition(raw_code))
         .unwrap_or_else(|| {
             definition(
-                "UNEXPECTED_ERROR",
+                UNEXPECTED_ERROR_CODE,
                 ErrorCategory::Internal,
                 false,
                 "The operation could not be completed.",
@@ -674,6 +752,7 @@ pub fn describe_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aid::AidError;
     use crate::batch::BatchError;
 
     fn correlation_id(env: &Env) -> BytesN<32> {
@@ -881,6 +960,7 @@ mod tests {
             (ErrorDomain::Oracle, 500, 510),
             (ErrorDomain::Upgradeability, 900, 911),
             (ErrorDomain::Import, 940, 948),
+            (ErrorDomain::Export, 920, 927),
             (ErrorDomain::Marketplace, 2000, 2023),
         ];
 
@@ -891,6 +971,66 @@ mod tests {
                     info.code,
                     String::from_str(&env, "UNEXPECTED_ERROR"),
                     "error code {raw_code} in {domain:?} must be documented"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stable_code_matches_describe_error_for_documented_codes() {
+        let env = Env::default();
+        let samples = [
+            (ErrorDomain::Shared, Error::Unauthorized as u32),
+            (ErrorDomain::Shared, Error::InvalidArgument as u32),
+            (ErrorDomain::Payments, Error::Expired as u32),
+            (ErrorDomain::Batch, BatchError::BatchTooLarge as u32),
+            (ErrorDomain::Aid, AidError::Unauthorized as u32),
+        ];
+
+        for (domain, raw_code) in samples {
+            let info = describe_error(&env, domain.clone(), raw_code, correlation_id(&env));
+            assert_eq!(
+                info.code,
+                String::from_str(&env, stable_code(domain.clone(), raw_code)),
+                "stable_code must agree with describe_error for {domain:?}/{raw_code}"
+            );
+            assert!(is_documented(domain, raw_code));
+        }
+    }
+
+    #[test]
+    fn undocumented_codes_are_reported_as_unexpected() {
+        assert_eq!(
+            stable_code(ErrorDomain::Oracle, 99_999),
+            UNEXPECTED_ERROR_CODE
+        );
+        assert!(!is_documented(ErrorDomain::Oracle, 99_999));
+    }
+
+    #[test]
+    fn every_documented_code_has_a_recovery_hint() {
+        let env = Env::default();
+        let ranges = [
+            (ErrorDomain::Aid, 100, 107),
+            (ErrorDomain::AccessControl, 200, 214),
+            (ErrorDomain::Oracle, 500, 510),
+            (ErrorDomain::Upgradeability, 900, 911),
+            (ErrorDomain::Export, 920, 927),
+            (ErrorDomain::Import, 940, 948),
+            (ErrorDomain::Marketplace, 2000, 2023),
+        ];
+
+        for (domain, first, last) in ranges {
+            for raw_code in first..=last {
+                let info =
+                    describe_error(&env, domain.clone(), raw_code, correlation_id(&env));
+                assert!(
+                    info.recovery.is_some(),
+                    "error code {raw_code} in {domain:?} must include a recovery hint"
+                );
+                assert!(
+                    !info.message.is_empty(),
+                    "error code {raw_code} in {domain:?} must include a safe message"
                 );
             }
         }

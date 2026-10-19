@@ -75,7 +75,11 @@ than once.
 | `shared::quota` | Per-actor `(actor, resource)` quota enforcement (`check_and_consume`), maintainer `get_quota_status` / `reset_quota` diagnostics, fail-open when unconfigured | `docs/QUOTA.md` |
 | `shared::config` | Typed env validation (`validate_full_config`, `Environment`), `UnsafeSecret` / `ConfigMissing` fail-fast errors, `RedactedSecret` previews that never print full secrets | `docs/CONFIGURATION.md` |
 | `shared::timeline` | User-facing activity timeline: `Public` / `Participant` / `Maintainer` visibility filtering, stable `ResourceLink` anchors, cursor pagination, and a maintainer-only audit store that is structurally separate from the user timeline | `docs/TIMELINE.md` |
+| `shared::operational_metadata` | Data minimization review and retention enforcement for operational metadata across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules with testable two-phase deletion, hold management, and migration adapters | `docs/OPERATIONAL_METADATA_RETENTION.md` |
+| `shared::audit_ledger` | Tamper-evident, hash-chained ledger for privileged and financial events: `append_event` / `append_privileged` / `append_financial`, `verify_chain`, bounded `export_ledger` + storage-free `verify_export`, and a `publish_head_checkpoint` anchor event | `docs/AUDIT_LEDGER.md` |
 | `shared::ledger_sequence` | Test-only deterministic ledger control (`LedgerSequenceHarness`): explicit sequence plus derived timestamp, forward-only `at()`, and `order_of` / `classify` boundary classification for same-ledger, next-ledger, expired-ledger and out-of-order submissions | `docs/LEDGER_ASSUMPTIONS.md` |
+| `shared::rollout_guard` | Feature-flag rollout guard with telemetry monitoring, automated rollback triggers (consecutive failures, error rates, invariant breaches), clean state verification across Treasury, Aid, Referral, Governance, Oracle, and Marketplace, and re-arming protection | `docs/FEATURE_FLAG_ROLLOUT_GUARD.md` |
+| `shared::export` | Permission-aware export pipeline across Treasury, Aid, Referral, Governance, Oracle, and Marketplace: bounded memory chunking (`DEFAULT_EXPORT_CHUNK_SIZE = 25`, `MAX_EXPORT_CHUNK_SIZE = 50`), in-flight cancellation (`cancel_export_stream`), forbidden field purging, and cumulative integrity digests | `docs/EXPORT_PIPELINE.md` |
 
 Ledger boundary tests run with `cargo test -p shared --lib test_ledger_sequence`
 (see `docs/LEDGER_ASSUMPTIONS.md` for the boundary table and determinism rules).
@@ -106,6 +110,7 @@ for backward compatibility. New protocol code should use the typed helpers in
 | `ContractPaused` | `emit_contract_paused` | `("contract", "paused")` | `(Address actor, u64 paused_at)` |
 | `ContractResumed` | `emit_contract_resumed` | `("contract", "resumed")` | `(Address actor, u64 resumed_at)` |
 | `ContractUpgraded` | `emit_contract_upgraded` | `("contract", "upgraded")` | `(Address actor, BytesN<32> wasm_hash, u64 upgraded_at)` |
+| `AuditHeadCheckpoint` | `publish_head_checkpoint` (`shared::audit_ledger`) | `("audit", "head")` | `(u64 length, BytesN<32> head_hash, u32 last_ledger, u64 last_timestamp)` |
 | `ModuleInitialized` | `emit_module_initialized` | `("logging", "initialized")` | `(Symbol module, u32 version, Address caller, u64 initialized_at)` |
 | `ActionExecuted` | `emit_action_executed` | `("logging", "action")` | `(Symbol module, Symbol action, Address caller, bool success, u64 executed_at)` |
 | `PermissionChanged` | `emit_permission_changed` | `("logging", "permission")` | `(Symbol module, Symbol role, Address subject, bool granted, u64 changed_at)` |

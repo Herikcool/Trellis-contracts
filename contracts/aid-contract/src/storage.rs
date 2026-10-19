@@ -14,6 +14,9 @@
 //! | `DonorIndex(donor)`    | persistent   | Append-only aid-ID list per donor; grows with  |
 //! |                        |              | the donor's history and must persist forever.  |
 //! | `RecipientIndex(addr)` | persistent   | Append-only aid-ID list per recipient.         |
+//! | `Milestones(id)`       | persistent   | Milestone tranches for a phased aid program;   |
+//! |                        |              | must persist until each tranche is settled.    |
+//! | `MilestoneVerifier`    | instance     | Address authorized to verify milestones.       |
 
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
@@ -21,7 +24,7 @@ use shared::storage::{
     instance_get, instance_set, persistent_get, persistent_has, persistent_remove, persistent_set,
 };
 
-use crate::types::AidRecord;
+use crate::types::{AidMilestone, AidRecord};
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -59,7 +62,27 @@ pub enum DataKey {
     CorrelationId(u64),
     /// Contract storage schema version (instance).
     StorageSchemaVersion,
+    /// Milestone tranches for a phased aid program (persistent).
+    Milestones(u64),
+    /// Address authorized to verify milestones (instance).
+    MilestoneVerifier,
+    /// Bucketed page of donor aids (persistent).
+    DonorAidsPage(Address, u32),
+    /// Total count of aids for a donor (persistent).
+    DonorAidCount(Address),
+    /// Bucketed page of recipient aids (persistent).
+    RecipientAidsPage(Address, u32),
+    /// Total count of aids for a recipient (persistent).
+    RecipientAidCount(Address),
+    /// Bucketed page of search index IDs (persistent).
+    SearchIndexPage(u32),
+    /// Total count of items in search index (persistent).
+    SearchIndexCount,
+    /// Authorized inspector address (persistent).
+    Inspector(Address),
 }
+
+pub const PAGE_SIZE: u32 = 50;
 
 // ---------------------------------------------------------------------------
 // Aid record helpers — persistent storage with automatic TTL extension
@@ -97,6 +120,37 @@ pub fn remove_aid(env: &Env, aid_id: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Milestone helpers — persistent storage with automatic TTL extension
+// ---------------------------------------------------------------------------
+
+/// Read the milestone tranches for an aid program.
+///
+/// Returns an empty vector when no milestones have been configured, which
+/// indicates a single-payout (all-or-nothing) program.
+#[inline]
+pub fn get_milestones(env: &Env, aid_id: u64) -> Vec<AidMilestone> {
+    persistent_get(env, &DataKey::Milestones(aid_id)).unwrap_or_else(|| Vec::new(env))
+}
+
+/// Write (or overwrite) the milestone tranches for an aid program.
+#[inline]
+pub fn set_milestones(env: &Env, aid_id: u64, milestones: &Vec<AidMilestone>) {
+    persistent_set(env, &DataKey::Milestones(aid_id), milestones);
+}
+
+/// Returns `true` when the aid program has milestone tranches configured.
+#[inline]
+pub fn has_milestones(env: &Env, aid_id: u64) -> bool {
+    persistent_has(env, &DataKey::Milestones(aid_id))
+}
+
+/// Remove the milestone tranches for an aid program (e.g. after settlement).
+#[inline]
+pub fn remove_milestones(env: &Env, aid_id: u64) {
+    persistent_remove(env, &DataKey::Milestones(aid_id));
+}
+
+// ---------------------------------------------------------------------------
 // Aid counter — instance storage
 // ---------------------------------------------------------------------------
 
@@ -130,33 +184,81 @@ pub fn set_token(env: &Env, token: &Address) {
 // Participant indexes — append-only ID lists for pagination
 // ---------------------------------------------------------------------------
 
-/// Read the full list of aid IDs created by `donor`.
-///
-/// The list is append-only: entries are added on `create_aid` and never
-/// removed, so claim/refund transitions only mutate the underlying records,
-/// keeping every index entry valid.
-pub fn get_donor_aids(env: &Env, donor: &Address) -> Vec<u64> {
-    persistent_get(env, &DataKey::DonorAids(donor.clone())).unwrap_or_else(|| Vec::new(env))
+pub fn get_donor_aid_count(env: &Env, donor: &Address) -> u32 {
+    persistent_get(env, &DataKey::DonorAidCount(donor.clone())).unwrap_or(0)
 }
 
-/// Append `aid_id` to `donor`'s index.
+pub fn get_donor_aids_page(env: &Env, donor: &Address, page: u32) -> Vec<u64> {
+    persistent_get(env, &DataKey::DonorAidsPage(donor.clone(), page)).unwrap_or_else(|| Vec::new(env))
+}
+
+/// Read the full list of aid IDs created by `donor`.
+pub fn get_donor_aids(env: &Env, donor: &Address) -> Vec<u64> {
+    let count = get_donor_aid_count(env, donor);
+    if count == 0 {
+        return persistent_get(env, &DataKey::DonorAids(donor.clone())).unwrap_or_else(|| Vec::new(env));
+    }
+    let total_pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut all_ids = Vec::new(env);
+    for p in 0..total_pages {
+        let page_vec = get_donor_aids_page(env, donor, p);
+        for id in page_vec.iter() {
+            all_ids.push_back(id);
+        }
+    }
+    all_ids
+}
+
+/// Append `aid_id` to `donor`'s index in O(1) writes within a bounded page.
 pub fn append_donor_aid(env: &Env, donor: &Address, aid_id: u64) {
-    let mut ids = get_donor_aids(env, donor);
-    ids.push_back(aid_id);
-    persistent_set(env, &DataKey::DonorAids(donor.clone()), &ids);
+    let count = get_donor_aid_count(env, donor);
+    let page = count / PAGE_SIZE;
+    let mut page_vec = get_donor_aids_page(env, donor, page);
+    page_vec.push_back(aid_id);
+    persistent_set(env, &DataKey::DonorAidsPage(donor.clone(), page), &page_vec);
+    persistent_set(env, &DataKey::DonorAidCount(donor.clone()), &(count + 1));
+}
+
+/// Append multiple `aid_ids` to `donor`'s index.
+pub fn append_donor_aids(env: &Env, donor: &Address, new_ids: &Vec<u64>) {
+    for id in new_ids.iter() {
+        append_donor_aid(env, donor, id);
+    }
+}
+
+pub fn get_recipient_aid_count(env: &Env, recipient: &Address) -> u32 {
+    persistent_get(env, &DataKey::RecipientAidCount(recipient.clone())).unwrap_or(0)
+}
+
+pub fn get_recipient_aids_page(env: &Env, recipient: &Address, page: u32) -> Vec<u64> {
+    persistent_get(env, &DataKey::RecipientAidsPage(recipient.clone(), page)).unwrap_or_else(|| Vec::new(env))
 }
 
 /// Read the full list of aid IDs assigned to `recipient`.
 pub fn get_recipient_aids(env: &Env, recipient: &Address) -> Vec<u64> {
-    persistent_get(env, &DataKey::RecipientIndex(recipient.clone()))
-        .unwrap_or_else(|| Vec::new(env))
+    let count = get_recipient_aid_count(env, recipient);
+    if count == 0 {
+        return persistent_get(env, &DataKey::RecipientIndex(recipient.clone())).unwrap_or_else(|| Vec::new(env));
+    }
+    let total_pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut all_ids = Vec::new(env);
+    for p in 0..total_pages {
+        let page_vec = get_recipient_aids_page(env, recipient, p);
+        for id in page_vec.iter() {
+            all_ids.push_back(id);
+        }
+    }
+    all_ids
 }
 
-/// Append `aid_id` to `recipient`'s index.
+/// Append `aid_id` to `recipient`'s index in O(1) writes within a bounded page.
 pub fn append_recipient_aid(env: &Env, recipient: &Address, aid_id: u64) {
-    let mut ids = get_recipient_aids(env, recipient);
-    ids.push_back(aid_id);
-    persistent_set(env, &DataKey::RecipientIndex(recipient.clone()), &ids);
+    let count = get_recipient_aid_count(env, recipient);
+    let page = count / PAGE_SIZE;
+    let mut page_vec = get_recipient_aids_page(env, recipient, page);
+    page_vec.push_back(aid_id);
+    persistent_set(env, &DataKey::RecipientAidsPage(recipient.clone(), page), &page_vec);
+    persistent_set(env, &DataKey::RecipientAidCount(recipient.clone()), &(count + 1));
 }
 
 pub fn get_donor_index(env: &Env, donor: &Address) -> Vec<u64> {
@@ -176,15 +278,46 @@ pub fn append_recipient_index(env: &Env, recipient: &Address, aid_id: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Permission-aware discovery index
+// Permission-aware discovery index — chunked/bucketed pages
 // ---------------------------------------------------------------------------
 
+pub fn get_search_index_count(env: &Env) -> u32 {
+    persistent_get(env, &DataKey::SearchIndexCount).unwrap_or(0)
+}
+
+pub fn get_search_index_page(env: &Env, page: u32) -> Vec<u64> {
+    persistent_get(env, &DataKey::SearchIndexPage(page)).unwrap_or_else(|| Vec::new(env))
+}
+
 pub fn get_search_index(env: &Env) -> Vec<u64> {
-    persistent_get(env, &DataKey::SearchIndex).unwrap_or_else(|| Vec::new(env))
+    let count = get_search_index_count(env);
+    if count == 0 {
+        return persistent_get(env, &DataKey::SearchIndex).unwrap_or_else(|| Vec::new(env));
+    }
+    let total_pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut all_ids = Vec::new(env);
+    for p in 0..total_pages {
+        let page_vec = get_search_index_page(env, p);
+        for id in page_vec.iter() {
+            all_ids.push_back(id);
+        }
+    }
+    all_ids
 }
 
 pub fn set_search_index(env: &Env, ids: &Vec<u64>) {
-    persistent_set(env, &DataKey::SearchIndex, ids);
+    let total_count = ids.len();
+    persistent_set(env, &DataKey::SearchIndexCount, &total_count);
+    let total_pages = if total_count == 0 { 0 } else { (total_count + PAGE_SIZE - 1) / PAGE_SIZE };
+    for p in 0..total_pages {
+        let mut page_vec = Vec::new(env);
+        let start = p * PAGE_SIZE;
+        let end = ((p + 1) * PAGE_SIZE).min(total_count);
+        for i in start..end {
+            page_vec.push_back(ids.get(i).unwrap());
+        }
+        persistent_set(env, &DataKey::SearchIndexPage(p), &page_vec);
+    }
 }
 
 pub fn is_search_hidden(env: &Env, aid_id: u64) -> bool {
@@ -236,6 +369,25 @@ pub fn set_default_expiry(env: &Env, expiry_secs: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Milestone verifier — instance storage
+// ---------------------------------------------------------------------------
+
+/// Read the address authorized to verify milestones, if configured.
+pub fn get_milestone_verifier(env: &Env) -> Option<Address> {
+    instance_get(env, &DataKey::MilestoneVerifier)
+}
+
+/// Store the address authorized to verify milestones.
+pub fn set_milestone_verifier(env: &Env, verifier: &Address) {
+    instance_set(env, &DataKey::MilestoneVerifier, verifier);
+}
+
+/// Remove the configured milestone verifier.
+pub fn remove_milestone_verifier(env: &Env) {
+    persistent_remove(env, &DataKey::MilestoneVerifier);
+}
+
+// ---------------------------------------------------------------------------
 // Initialization flag — instance storage
 // ---------------------------------------------------------------------------
 
@@ -266,4 +418,12 @@ pub fn set_storage_schema_version(env: &Env, version: u32) {
 /// Verify that the storage schema version is currently supported for read paths.
 pub fn guard_storage_read(env: &Env) -> Result<u32, shared::Error> {
     shared::storage_version::guard_storage_read(env)
+}
+
+pub fn is_inspector(env: &Env, inspector: &Address) -> bool {
+    persistent_get(env, &DataKey::Inspector(inspector.clone())).unwrap_or(false)
+}
+
+pub fn set_inspector(env: &Env, inspector: &Address, enabled: bool) {
+    persistent_set(env, &DataKey::Inspector(inspector.clone()), &enabled);
 }

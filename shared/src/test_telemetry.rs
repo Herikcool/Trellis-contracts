@@ -15,6 +15,9 @@ use crate::telemetry::{
     TelemetryResult, TelemetryTimer, CORE_OPERATIONS, OP_PAYMENT_TRANSFER, OP_QUOTA_CONSUME,
     OP_REBALANCE, TELEMETRY_TOPIC,
 };
+use crate::telemetry_protection::{
+    is_safe_label, redact_label, sample_decision, SamplingConfig, MAX_LABEL_LEN,
+};
 
 #[contract]
 pub struct TelemetryFixture;
@@ -163,4 +166,43 @@ fn payload_topics_are_bounded_and_sensitive_free() {
     assert_eq!(event.result, TelemetryResult::Success);
     assert_eq!(event.latency_ledgers, 0);
     assert_eq!(event.correlation_id, env.ledger().sequence() as u64);
+}
+
+#[test]
+fn unsafe_labels_are_rejected_and_sensitive_values_redacted() {
+    // High-cardinality / sensitive labels must be rejected outright.
+    assert!(!is_safe_label("user:GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV"));
+    assert!(!is_safe_label("amount:1234567890"));
+    assert!(!is_safe_label(""));
+    assert!(!is_safe_label(&"x".repeat(MAX_LABEL_LEN + 1)));
+
+    // Safe, bounded labels pass through unchanged.
+    assert!(is_safe_label("op:payment_transfer"));
+    assert!(is_safe_label("actor:user"));
+
+    // Redaction replaces sensitive values with a stable placeholder.
+    let redacted = redact_label("user:GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV");
+    assert_eq!(redacted, "user:<redacted>");
+    let redacted_amount = redact_label("amount:1234567890");
+    assert_eq!(redacted_amount, "amount:<redacted>");
+}
+
+#[test]
+fn sampling_keeps_dashboards_useful_under_abusive_volume() {
+    let config = SamplingConfig::new(10, 100);
+
+    // Under the burst threshold, every event is kept.
+    for i in 0..10u32 {
+        assert!(sample_decision(&config, i, 0));
+    }
+
+    // Above the threshold, sampling kicks in deterministically.
+    let kept: u32 = (0..100u32)
+        .filter(|i| sample_decision(&config, *i, 1_000))
+        .count() as u32;
+    assert!(kept > 0, "sampling must not drop all events");
+    assert!(kept < 100, "sampling must reduce abusive volume");
+
+    // Errors are always retained regardless of volume.
+    assert!(sample_decision(&config, 0, 1_000_000));
 }

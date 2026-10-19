@@ -19,6 +19,13 @@
 //! - **Proposal**: `Pending → Executed`
 //! - **ContractRecord**: `Active → Deactivated → Active` (deprecation lifecycle)
 //!
+//! ## Formal Lifecycle Model
+//!
+//! Each lifecycle is modeled as a deterministic finite state machine with an
+//! explicit set of terminal states and recovery transitions. See the
+//! `lifecycle_model` module below for the canonical transition table used by
+//! the exhaustive tests.
+//!
 //! ## Usage Example
 //!
 //! ```ignore

@@ -70,5 +70,113 @@
     "migration_notes": "",
     "issue": 192,
     "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-16",
+    "impact": "compatible",
+    "summary": "Added operator-safe backfill tool with dry-run diff preview, resumable checkpoints, rollback support, and detailed skipped/failed record reporting across treasury, aid, referral, governance, oracle, and marketplace modules (Issue #217).",
+    "migration_notes": "",
+    "issue": 217,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-16",
+    "impact": "compatible",
+    "summary": "Added data minimization review and retention enforcement for operational metadata across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules with two-phase deletion, holds, and migration adapters (Issue #229).",
+    "migration_notes": "",
+    "issue": 229,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-16",
+    "impact": "compatible",
+    "summary": "Added release readiness gate and automated verification for migrations, security checks, smoke tests, and rollback rehearsals across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules (Issue #253).",
+    "migration_notes": "",
+    "issue": 253,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added shared::audit_ledger: an append-only hash-chained ledger for privileged and financial events with on-chain verify_chain, bounded permissioned export_ledger, storage-free verify_export, and a head checkpoint anchor (Issue #233).",
+    "migration_notes": "",
+    "issue": 233,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added accessibility coverage for keyboard navigation, focus management, roving tabindex, and async contract status state mapping to ARIA live regions in shared::accessibility (Issue #296).",
+    "migration_notes": "",
+    "issue": 296,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added contributor diagnostics for toolchain, dependency invariant validation, contract storage schemas, and workspace fixture health in shared::diagnostics and scripts/contributor-diagnostics.cjs (Issue #297).",
+    "migration_notes": "",
+    "issue": 297,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Implemented explainable risk scoring for suspicious high-impact actions with transparent factor vectors, configurable policies, and actionable verdicts in shared::risk_scoring (Issue #298).",
+    "migration_notes": "",
+    "issue": 298,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added release readiness checks for schema migrations, deployment smoke tests, automated rollback rehearsals, and dual-admin signoff in shared::release_readiness (Issue #299).",
+    "migration_notes": "",
+    "issue": 299,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Implemented permission-aware export pipeline with bounded memory streaming, in-flight cancellation, multi-module role authorization (Treasury, Aid, Referral, Governance, Oracle, Marketplace), and forbidden field purging in shared::export.",
+    "migration_notes": "",
+    "issue": 300,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-18",
+    "impact": "compatible",
+    "summary": "Added external dependency degradation matrix with failure modes, tiered degradation levels, user-safe fallback strategies, automated verification checks, and recovery receipts in shared::degradation (Issue #231).",
+    "migration_notes": "",
+    "issue": 231,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-18",
+    "impact": "compatible",
+    "summary": "Implemented risk-scored abuse detection for suspicious high-impact operations with explainable risk signals, strike accumulation, step-up dual-authorization review, velocity throttling, and safe low-risk allowance in shared::abuse and shared::risk_scoring (Issue #242).",
+    "migration_notes": "",
+    "issue": 242,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-18",
+    "impact": "compatible",
+    "summary": "Implemented policy simulation preview framework before committing irreversible or high-impact changes, previewing affected records and users, expected operational side effects, and rollback constraints in shared::policy_preview (Issue #250).",
+    "migration_notes": "",
+    "issue": 250,
+    "pr": null
   }
 ]

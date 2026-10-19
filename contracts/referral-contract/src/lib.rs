@@ -1365,4 +1365,321 @@ mod tests {
         let result = referral.try_register_referral_code(&attacker, &owner, &code);
         assert_eq!(result, Err(Ok(Error::Unauthorized)));
     }
+
+    // ===========================================================================
+    // Formal lifecycle state-machine tests
+    //
+    // The referral contract exposes a small set of lifecycle states per wallet
+    // and per referrer. These tests enumerate the terminal and recovery
+    // transitions explicitly so that any future change to the state machine
+    // fails deterministically here rather than silently in production.
+    //
+    // State model (per wallet):
+    //   Unregistered --register/set_referrer--> Registered --(no exit)-->
+    //   Registered is terminal for the wallet edge; only admin `set_referrer`
+    //   can overwrite it, and that is treated as a recovery path.
+    //
+    // State model (per referrer, for accrued rewards):
+    //   Zero --accrue--> Accrued --claim--> Zero (terminal for that cycle)
+    //   Accrued --accrue--> Accrued (monotonic growth, capped)
+    //   Capped --accrue--> Capped (terminal, no further credit)
+    //
+    // Recovery paths covered:
+    //   - Treasury failure during claim leaves accrued balance intact so the
+    //     referrer can retry (claim is idempotent on failure).
+    //   - Admin `set_referrer` overwrites a stale edge (recovery from a bad
+    //     registration) without touching accrued balances.
+    //   - Registry resolution falls back to the directly configured treasury
+    //     when the registry lookup fails.
+    // ===========================================================================
+
+    /// Lifecycle state of a wallet edge in the referral graph.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum EdgeState {
+        Unregistered,
+        Registered,
+    }
+
+    fn edge_state(referral: &ReferralContractClient, wallet: &Address) -> EdgeState {
+        if referral.get_referrer(wallet).is_some() {
+            EdgeState::Registered
+        } else {
+            EdgeState::Unregistered
+        }
+    }
+
+    /// Lifecycle state of a referrer's reward bucket.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RewardState {
+        Zero,
+        Accrued,
+        Capped,
+    }
+
+    fn reward_state(referral: &ReferralContractClient, referrer: &Address) -> RewardState {
+        let accrued = referral.accrued_balance(referrer);
+        let lifetime = referral.lifetime_accrued(referrer);
+        let cap = referral.get_tier_config().unwrap().reward_cap;
+        if lifetime >= cap && cap > 0 {
+            RewardState::Capped
+        } else if accrued > 0 || lifetime > 0 {
+            RewardState::Accrued
+        } else {
+            RewardState::Zero
+        }
+    }
+
+    #[test]
+    fn lifecycle_edge_unregistered_to_registered_is_the_only_forward_transition() {
+        let (env, referral_id, admin, _referred, tier_one, tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        // Bootstrap referrer so registration is valid.
+        referral.set_referrer(&admin, &tier_one, &tier_two);
+
+        let wallet = Address::generate(&env);
+        assert_eq!(edge_state(&referral, &wallet), EdgeState::Unregistered);
+
+        referral.register(&wallet, &tier_one);
+        assert_eq!(edge_state(&referral, &wallet), EdgeState::Registered);
+
+        // There is no public API to transition Registered -> Unregistered.
+        // Re-registering the same wallet must fail deterministically.
+        assert!(matches!(
+            referral.try_register(&wallet, &tier_one),
+            Err(Ok(Error::InvalidArgument))
+        ));
+        assert_eq!(edge_state(&referral, &wallet), EdgeState::Registered);
+    }
+
+    #[test]
+    fn lifecycle_invalid_edge_transitions_fail_deterministically() {
+        let (env, referral_id, admin, _referred, tier_one, tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        referral.set_referrer(&admin, &tier_one, &tier_two);
+
+        // Unregistered -> Unregistered via self-referral is invalid.
+        assert!(matches!(
+            referral.try_register(&tier_one, &tier_one),
+            Err(Ok(Error::InvalidArgument))
+        ));
+
+        // Unregistered -> Unregistered via nonexistent referrer is invalid.
+        let wallet = Address::generate(&env);
+        let ghost = Address::generate(&env);
+        assert!(matches!(
+            referral.try_register(&wallet, &ghost),
+            Err(Ok(Error::InvalidArgument))
+        ));
+
+        // Unregistered -> Unregistered via cycle is invalid.
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        referral.set_referrer(&admin, &a, &b);
+        assert!(matches!(
+            referral.try_set_referrer(&admin, &b, &a),
+            Err(Ok(Error::InvalidArgument))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_reward_zero_to_accrued_to_zero_is_terminal_per_cycle() {
+        let (env, referral_id, admin, referred, tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &10_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+
+        assert_eq!(reward_state(&referral, &tier_one), RewardState::Zero);
+
+        referral.accrue(&admin, &referred, &10_000);
+        assert_eq!(reward_state(&referral, &tier_one), RewardState::Accrued);
+
+        referral.claim_rewards(&tier_one);
+        // Accrued balance returns to zero, but lifetime remains > 0 so the
+        // bucket is still considered Accrued (not Zero) for cap purposes.
+        assert_eq!(referral.accrued_balance(&tier_one), 0);
+        assert_eq!(reward_state(&referral, &tier_one), RewardState::Accrued);
+
+        // A second claim in the same cycle is a no-op terminal transition.
+        assert_eq!(referral.claim_rewards(&tier_one), 0);
+    }
+
+    #[test]
+    fn lifecycle_reward_capped_is_terminal_and_no_further_credit() {
+        let (env, referral_id, admin, referred, tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &1_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+
+        assert_eq!(referral.accrue(&admin, &referred, &10_000), 1_000);
+        assert_eq!(reward_state(&referral, &tier_one), RewardState::Capped);
+
+        // Terminal: further accruals credit nothing.
+        assert_eq!(referral.accrue(&admin, &referred, &10_000), 0);
+        assert_eq!(referral.accrue(&admin, &referred, &10_000), 0);
+        assert_eq!(referral.lifetime_accrued(&tier_one), 1_000);
+    }
+
+    #[test]
+    fn lifecycle_recovery_claim_failure_preserves_accrued_balance() {
+        let (env, referral_id, admin, referred, tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+        let treasury_id = referral.get_treasury();
+        let treasury = MockTreasuryClient::new(&env, &treasury_id);
+
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &10_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+        referral.accrue(&admin, &referred, &10_000);
+        assert_eq!(referral.accrued_balance(&tier_one), 1_000);
+
+        // Drain the treasury so the claim fails.
+        let drained = treasury.rewards_balance();
+        treasury.deposit_rewards(&-drained);
+        assert_eq!(treasury.rewards_balance(), 0);
+
+        // Claim must fail and leave the accrued balance intact for retry.
+        assert!(referral.try_claim_rewards(&tier_one).is_err());
+        assert_eq!(referral.accrued_balance(&tier_one), 1_000);
+
+        // Recovery: refill treasury and retry the claim.
+        treasury.deposit_rewards(&1_000_000_000);
+        assert_eq!(referral.claim_rewards(&tier_one), 1_000);
+        assert_eq!(referral.accrued_balance(&tier_one), 0);
+        assert_eq!(treasury.paid_to(&tier_one), 1_000);
+    }
+
+    #[test]
+    fn lifecycle_recovery_admin_overwrite_of_stale_edge_preserves_balances() {
+        let (env, referral_id, admin, referred, tier_one, tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &10_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+        referral.accrue(&admin, &referred, &10_000);
+        assert_eq!(referral.accrued_balance(&tier_one), 1_000);
+
+        // Recovery: admin overwrites the stale edge to point at tier_two.
+        referral.set_referrer(&admin, &referred, &tier_two);
+        assert_eq!(referral.get_referrer(&referred), Some(tier_two));
+
+        // Accrued balances are untouched by the edge rewrite.
+        assert_eq!(referral.accrued_balance(&tier_one), 1_000);
+        assert_eq!(referral.accrued_balance(&tier_two), 0);
+    }
+
+    #[test]
+    fn lifecycle_recovery_registry_failure_falls_back_to_direct_treasury() {
+        let (env, referral_id, admin, referred, tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+        let registry_id = env.register_contract(None, MockRegistry);
+        let registry = MockRegistryClient::new(&env, &registry_id);
+
+        // Registry is configured but has no "treasury" entry, so lookup fails.
+        registry.initialize(&admin);
+        referral.set_registry(&admin, &registry_id);
+
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &10_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+        referral.accrue(&admin, &referred, &10_000);
+
+        // Claim must succeed via the direct treasury fallback.
+        assert_eq!(referral.claim_rewards(&tier_one), 1_000);
+        assert_eq!(referral.accrued_balance(&tier_one), 0);
+    }
+
+    #[test]
+    fn lifecycle_invalid_reward_transitions_fail_deterministically() {
+        let (env, referral_id, admin, referred, tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &10_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+
+        // Zero -> Accrued with non-positive base amount is invalid.
+        assert!(matches!(
+            referral.try_accrue(&admin, &referred, &0),
+            Err(Ok(Error::InvalidArgument))
+        ));
+        assert!(matches!(
+            referral.try_accrue(&admin, &referred, &-1),
+            Err(Ok(Error::InvalidArgument))
+        ));
+
+        // Non-admin cannot drive the reward state machine.
+        let attacker = Address::generate(&env);
+        assert!(matches!(
+            referral.try_accrue(&attacker, &referred, &10_000),
+            Err(Ok(Error::Unauthorized))
+        ));
+
+        // Claim with zero accrued is a valid terminal no-op.
+        assert_eq!(referral.claim_rewards(&tier_one), 0);
+    }
+
+    #[test]
+    fn lifecycle_tier_config_reconfiguration_is_a_recovery_path() {
+        let (env, referral_id, admin, referred, tier_one, _tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        // Initial config: 10% tier 1, cap 1_000.
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &1_000);
+        referral.set_referrer(&admin, &referred, &tier_one);
+        referral.accrue(&admin, &referred, &10_000);
+        assert_eq!(referral.lifetime_accrued(&tier_one), 1_000);
+        assert_eq!(reward_state(&referral, &tier_one), RewardState::Capped);
+
+        // Recovery: admin raises the cap. Lifetime accrued is preserved and
+        // the referrer can accrue again.
+        referral.set_tier_config(&admin, &soroban_sdk::vec![&env, 1_000_i128], &1, &2_000);
+        assert_eq!(referral.lifetime_accrued(&tier_one), 1_000);
+        assert_eq!(referral.accrue(&admin, &referred, &10_000), 1_000);
+        assert_eq!(referral.lifetime_accrued(&tier_one), 2_000);
+        assert_eq!(reward_state(&referral, &tier_one), RewardState::Capped);
+    }
+
+    #[test]
+    fn lifecycle_vanity_code_registration_is_terminal_per_owner_and_code() {
+        let (env, referral_id, admin, _referred, tier_one, tier_two, _tier_three, _tier_four) =
+            setup();
+        let referral = ReferralContractClient::new(&env, &referral_id);
+
+        let owner = Address::generate(&env);
+        let code = Symbol::new(&env, "LIFE2026");
+        referral.register_referral_code(&admin, &owner, &code);
+
+        // Terminal: same code cannot be re-registered to another owner.
+        let other = Address::generate(&env);
+        assert!(matches!(
+            referral.try_register_referral_code(&admin, &other, &code),
+            Err(Ok(Error::InvalidArgument))
+        ));
+
+        // Terminal: same owner cannot register a second code.
+        let code2 = Symbol::new(&env, "LIFE2027");
+        assert!(matches!(
+            referral.try_register_referral_code(&admin, &owner, &code2),
+            Err(Ok(Error::InvalidArgument))
+        ));
+
+        // Recovery: register_by_code resolves the code and performs the
+        // standard registration transition.
+        referral.set_referrer(&admin, &tier_one, &tier_two);
+        let code3 = Symbol::new(&env, "LIFE2028");
+        referral.register_referral_code(&admin, &tier_one, &code3);
+        let wallet = Address::generate(&env);
+        referral.register_by_code(&wallet, code3);
+        assert_eq!(referral.get_referrer(&wallet), Some(tier_one));
+    }
 }

@@ -1,0 +1,17 @@
+[
+  {
+    "asset": "XLM/USD",
+    "price": "125000",
+    "timestamp": 1790600000
+  },
+  {
+    "asset": "USDC/USD",
+    "price": "1000000",
+    "timestamp": 1790600000
+  },
+  {
+    "asset": "BTC/USD",
+    "price": "65000000000",
+    "timestamp": 1790600000
+  }
+]

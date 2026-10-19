@@ -61,6 +61,9 @@
 | [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md) | The PR checklist, what's automated vs. reviewer judgment, and the emergency-fix exception process |
 | [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md) | Formal protocol invariants (token conservation, referral acyclicity, oracle quorum/staleness, admin non-revocability) with the code and error variant that enforces each one |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Trust assumptions, adversarial attack vectors per contract family, and pause/emergency-response pointers |
+| [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) | Tamper-evident hash-chained ledger for privileged/financial events: hashing rules, verification, export, failure modes, and recovery runbook |
+| [docs/SYNTHETIC_JOURNEY_MONITOR.md](docs/SYNTHETIC_JOURNEY_MONITOR.md) | Runnable fund/quote/settle synthetic monitor, failure attribution, and recovery guidance |
+| [docs/RECONCILIATION_JOB.md](docs/RECONCILIATION_JOB.md) | Projection reconciliation job: comparing canonical truth with derived state, dry-run safety, and idempotent repair |
 - Storage Layout
 - Documentation
 - Contribution Guide
@@ -3740,6 +3743,7 @@ This repository contains comprehensive documentation for contract design, gas op
 - [**SECURITY_BATCH.md**](SECURITY_BATCH.md) — Security analysis of batch operations including reentrancy protection, input validation, and failure semantics.
 - [**docs/IMPORT_PIPELINE.md**](docs/IMPORT_PIPELINE.md) — Bulk import pipeline with pre-flight dry-run validation, duplicate detection, and prescriptive rollback guidance.
 - [**docs/PREFLIGHT.md**](docs/PREFLIGHT.md) — Deterministic pre-submission preflight for high-risk operations with ready/warning/blocked verdicts, remediation steps, and shared error mapping.
+- [**docs/AUDIT_LEDGER.md**](docs/AUDIT_LEDGER.md) — Append-only hash-chained ledger for privileged and financial events: hashing definition, verification and export APIs, failure-mode table, and rollback/recovery runbook.
 
 ## Module Documentation
 
