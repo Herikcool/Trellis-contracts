@@ -865,7 +865,7 @@ pub fn timeline_page(
     // Resume from the last sequence number actually examined, which may be a
     // hidden or deleted one — that is what keeps a filtered page from skipping
     // entries when the caller comes back.
-    let next_cursor = if has_more || !entries.is_empty() {
+    let next_cursor = if has_more {
         Some(next.saturating_sub(1))
     } else {
         None

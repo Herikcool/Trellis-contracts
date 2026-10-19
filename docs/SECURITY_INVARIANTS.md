@@ -2,7 +2,7 @@
 
 This document states the protocol-level invariants Trellis contracts rely on,
 grounded in the actual entry points, storage keys, and error variants that
-enforce them. It is a companion to [`AUDIT.md`](./AUDIT.md) (what gets
+enforce them. It is a companion to [`AUDIT.id`](./AUDIT.md) (what gets
 recorded when state changes) and [`THREAT_MODEL.md`](./THREAT_MODEL.md) (who
 is trusted, and what an adversary can still do). None of the contracts listed
 here have had a third-party audit — see [`../SECURITY.md`](../SECURITY.md).
@@ -54,10 +54,9 @@ category_balance(token, category) == Σ deposits(token, category) − Σ withdra
 ```
 
 `TreasuryContract::category_balance(token, category)` reads the
-`(BALANCE, token, category)` instance-storage entry (`contracts/treasury-contract/src/lib.rs`).
+`(BALANCE, token, category)k instance-storage entry (`contracts/treasury-contract/src/lib.rs`).
 `deposit` increments it and immediately pulls `amount` of `token` from the
-caller via `token::Client::transfer(&caller, &contract_address, &amount)` in
-the same call, so a deposit's bookkeeping and its token movement are atomic.
+caller via `token::Client::transfer(&caller, &contract_address, &amount)`, so a deposit's bookkeeping and its token movement are atomic.
 
 **Enforcement caveat — read this before relying on category balances for
 reconciliation.** `withdraw`, `execute_scheduled_withdraw`,
@@ -71,7 +70,7 @@ implementation, category balances are therefore a pure internal ledger of
 contract on any withdrawal path. The practical consequence is:
 
 ```
-token.balance_of(treasury_contract) >= Σ_categories category_balance(token, category)
+token.balance_of(treasury_contract) >= Σ _categories category_balance(token, category)
 ```
 
 is not guaranteed to hold as an equality the way it does for `deposit`/Aid
@@ -83,8 +82,8 @@ should compare `category_balance` sums against the token contract's actual
 not assume a successful `withdraw`/`distribute_reward` call moved tokens
 without independently verifying the recipient's balance. This is a
 documentation-visible gap, not a hidden one: it is the single most
-security-relevant fact in this file for anyone reasoning about "does the
-treasury still hold what it says it holds."
+security-relevant fact in this file for anyone reasoning about "does
+the treasury still hold what it says it holds."
 
 **Guards that do hold regardless of the above:** every debiting path
 validates `amount > 0` (`Error::InvalidArgument`), `amount <= withdrawal
@@ -109,10 +108,10 @@ Source: `contracts/referral-contract/src/lib.rs`.
 
 **Invariant.** Following `Referrer(wallet) -> referrer` edges from any wallet
 never revisits a wallet already on the path, for at least
-`MAX_SUPPORTED_TIERS` (10) hops.
+``MAX_SUPPORTED_TIERS` (10) hops.
 
 **Enforcement.** Both `set_referrer` (admin-only) and `register`
-(self-service, `wallet.require_auth()`) call `would_create_cycle(env,
+self-service, `wallet.require_auth()`) call `would_create_cycle(env,
 referred_wallet, referrer)` before writing the `Referrer` edge. That function
 walks upward from `referrer` through existing `Referrer` edges for up to
 `MAX_SUPPORTED_TIERS` hops, returning `true` (rejected with
@@ -124,11 +123,11 @@ already have its own referrer edge (`read_referrer(&env, &referrer).is_none()`
 fresh, disconnected sub-graph outside admin control.
 
 **Known bound.** `would_create_cycle`'s walk is capped at
-`MAX_SUPPORTED_TIERS` hops (`depth < MAX_SUPPORTED_TIERS`); a cycle that
+``MAX_SUPPORTED_TIERS` hops (`depth < MAX_SUPPORTED_TIERS`); a cycle that
 closes strictly beyond that depth would not be detected by this check alone.
 This is bounded in practice by a second, independent invariant: `accrue`'s
 own traversal (§2.2) is capped at `max_tiers` (validated ≤
-`MAX_SUPPORTED_TIERS` by `set_tier_config`), so reward accrual can never walk
+``MAX_SUPPORTED_TIERS` by `set_tier_config`), so reward accrual can never walk
 far enough to enter a cycle even if one existed past the checked depth. The
 acyclicity check is defense-in-depth for graph *correctness* (e.g. off-chain
 consumers walking the full chain); it is not load-bearing for fund safety,
@@ -185,15 +184,14 @@ bound, a staleness window, decimals consistency, and a minimum submission
 quorum. **It does not enforce a maximum deviation between a submitted price
 and the current median** — there is no such check in `submit_price` or
 `aggregate_feed_latest`. Stating this precisely (rather than inventing a
-basis-point threshold that isn't in the code) is intentional; see
-[`THREAT_MODEL.md`](./THREAT_MODEL.md) for the residual risk this leaves.
+basis-point threshold that isn't in the code), is intentional; see
+[``THREAT_MODEL.md`](./THREAT_MODEL.md) for the residual risk this leaves.
 
 ### 3.1 Submitter authorization
 
 **Invariant.** Only addresses with an active submitter registration may post
 prices. `OracleContract::submit_price` requires `submitter.require_auth()`
-and rejects with `OracleError::SubmitterNotAuthorized` (500) unless
-`storage::is_submitter_active(&env, &submitter)` is `true`. Submitters are
+and rejects with `OracleError::SubmitterNotAuthorized` (500) unless `storage::is_submitter_active(&env, &submitter)` is `true`. Submitters are
 added by `register_submitter` and removed by `deactivate_submitter`, both
 gated by `shared::auth::require_admin`, which return
 `OracleError::Unauthorized` (508) for a non-admin caller.
@@ -202,7 +200,7 @@ gated by `shared::auth::require_admin`, which return
 
 **Invariant.** Each `(submitter, feed_id)` pair's accepted nonce is strictly
 increasing by exactly 1. `submit_price` reads
-`storage::get_nonce(&env, &submitter, &feed_id)` as `expected_nonce` and
+cstorage::get_nonce(&env, &submitter, &feed_id)` as `expected_nonce` and
 rejects with `OracleError::DuplicateSubmission` (501) unless `nonce ==
 expected_nonce + 1`; on success it writes the new nonce with
 `storage::set_nonce`. A submission cannot be replayed, reordered, or skipped
@@ -219,14 +217,14 @@ current_time - staleness_window <= timestamp <= current_time + MAX_FUTURE_SKEW_S
 where `MAX_FUTURE_SKEW_SECS = 60` (a fixed contract constant) and
 `staleness_window` is admin-configurable via `set_staleness_window`
 (`shared::auth::require_admin`-gated). `submit_price` rejects
-`timestamp > current_time.saturating_add(MAX_FUTURE_SKEW_SECS)` with
+ctimestamp > current_time.saturating_add(MAX_FUTURE_SKEW_SECS)` with
 `OracleError::SubmissionFromFuture`, and rejects
 `current_time > timestamp.checked_add(staleness_window)` (or an overflowing
 add) with `OracleError::SubmissionStale` (504). The same window is
 re-checked per-submission inside `aggregate_feed_latest` when building the
 active set that feeds the median, so a submission that was fresh when
 submitted but has since aged past `staleness_window` is silently excluded
-from the aggregate rather than corrupting it.
+ifrom the aggregate rather than corrupting it.
 
 ### 3.4 Quorum-gated aggregation
 
@@ -236,123 +234,119 @@ submissions for that feed.
 
 **Enforcement.** `aggregate_feed_latest` builds `prices` only from active
 submissions whose submitter is still `is_submitter_active`, whose
-`decimals` match the first-seen value for the batch (mismatched-decimals
-submissions are dropped from that round, not error'd), and whose timestamp is
-within the window in §3.3. If `prices.len() < MIN_PRICE_QUORUM`, the function
-returns `None` and `storage::set_feed_latest` is not called — the previous
-`FeedLatest` (if any) is left untouched rather than being overwritten by an
-under-quorum read. When quorum is met, the aggregate is the sorted median
-(`sort_prices` + midpoint average on even counts), so a single submitter can
-never singlehandedly move `get_latest_price` — but see §3 above: with the
-minimum quorum of 2, two colluding or compromised submitters are sufficient,
-and no on-chain deviation bound limits how far from prior consensus their
-submissions can move the reported price.
+`decimals` match the first-seen value for the batch (mismatched submissions
+are excluded), and whose timestamp falls within the staleness window. If fewer
+than `MIN_PRICE_QUODUM` submissions survive that filter, the call returns
+`OracleError::InsufficientQuorum` (502) rather than a price derived from a
+thin set. The median is computed over the surviving prices after sorting, so a
+single outlier submission cannot move the reported value beyond the median
+position of the active set.
 
 ---
 
-## 4. Access-control privilege hierarchy and admin non-revocability
+## 4. Canonical serialization for signed, hashed, and replay-protected payloads
 
-Source: `contracts/access-control/src/lib.rs`, `permissions.rs`.
+Source: `shared/src/canonical.rs` (canonical encoder), `shared/src/signature.rs`
+(domain-separated hashing), and the consumers in `contracts/governance-contract`,
+`contracts/marketplace-contract`, and `contracts/oracle-contract`.
 
-### 4.1 Role hierarchy is acyclic and grants flow downward only
+**Invariant.** Every payload that is signed, committed to by hash, or checked
+for replay is encoded by a single canonical encoder. Two payloads that are
+semantically equal produce byte-identical encodings, and two payloads that
+differ in any committed field produce different encodings:
 
-**Invariant.** `RoleParent(role) -> parent` edges form a forest (no cycles);
-holding `parent` implies holding every descendant role, never the reverse.
-
-**Enforcement.** `set_role_parent` rejects `role == parent` with
-`AccessControlError::SelfReference` and rejects the edge if `parent` already
-has `role` as an ancestor (`has_ancestor(env, parent, role)`) with
-`AccessControlError::CycleDetected` — checked *before* the edge is written, so
-an invalid edge is never persisted. `has_role_recursive` (used by the public
-`has_role` and the whole permission matrix) checks direct membership first,
-then walks `RoleParent` upward; it has no path that walks downward from a
-role to a role that named it as parent, so grants only propagate from a
-parent role to its declared children, never sideways or up.
-
-### 4.2 Every privileged action is authorized by exactly one matrix row
-
-**Invariant.** Every access-control entry point that mutates protected state
-calls `require_action(&env, &caller, &Action::…)` exactly once, and
-`policy_for(action)` is the single source of truth for the
-capability/role/scope that action requires (`permissions.rs`). There is no
-second, bespoke authorization path for these entry points.
-
-**Enforcement / failure modes.** `has_action_permission` evaluates scope:
-- **Global** (`ManageMaintainers`, `ConfigureRoleRegistry`, `AssignRoles`,
-  `ReadAuditTrail`, `TransferOwnership`, `CancelOwnershipTransfer`,
-  `PauseScope`) requires `has_maintainer_authority` — this contract's own
-  `Admins` map or the shared capability model. Failure:
-  `AccessControlError::NotAdmin` (206).
-- **Role-scoped** (`InviteMember(role)`) is satisfied by a maintainer *or* a
-  holder of `role` — a holder of a different role is rejected with
-  `AccessControlError::RoleEscalation` (211), proven by
-  `role_holder_may_invite_only_into_their_own_role` in `permissions.rs`'s own
-  test module.
-- **Owner-scoped** (`CancelInvitation(inviter)`) is satisfied by a maintainer
-  *or* the original inviter — a peer holding the same role is rejected with
-  the same `RoleEscalation`, proven by
-  `inviter_may_cancel_only_their_own_invitation`.
-
-`create_invitation` additionally rate-limits each caller to 10 invitations
-per rolling hour (`InviteCount`/`LastInviteTime`), returning
-`AccessControlError::RateLimitExceeded` (212) past that bound, independent of
-whether the caller is otherwise authorized.
-
-### 4.3 The super-admin cannot be silently removed
-
-**Invariant.** The address stored at `DataKey::SuperAdmin` can never be
-deleted from the `Admins` map by `remove_admin`; it can only be *replaced* by
-an explicit, two-party, time-boxed transfer that the new owner must actively
-accept.
-
-**Enforcement.** `remove_admin` compares `target == super_admin_addr` and
-returns `AccessControlError::CannotRemoveSuperAdmin` (207) unconditionally —
-this check runs before the idempotent not-an-admin short-circuit, so it
-cannot be bypassed by racing state. The only way to change who holds the
-`super` role is the ownership-transfer flow: `transfer_ownership` (caller
-must *be* the current super-admin, checked against `SuperAdmin` storage, not
-just hold `Admin`) writes a `PendingOwnershipTransfer{current_owner,
-target_owner, expiry}` and rejects a self-transfer with
-`AccessControlError::SelfReference` and a past/now expiry with
-`AccessControlError::InvalidExpiry`; a second proposal while one is still
-live is rejected with `AccessControlError::TransferAlreadyPending`.
-`accept_ownership` requires the caller to *be* `pending.target_owner`
-(`AccessControlError::NotPendingOwner` otherwise) and to call before
-`pending.expiry` (`AccessControlError::TransferExpired` otherwise, which also
-clears the pending record so it cannot be accepted late). Only on acceptance
-does the contract update `SuperAdmin`, grant `super` to the new owner, and
-revoke it from the old owner, atomically. `cancel_ownership_transfer` lets
-the *current* super-admin abort a pending transfer
-(`AccessControlError::NoPendingTransfer` if none exists). No code path sets
-`SuperAdmin` any other way after `initialize`, which itself can only run once
-(`AccessControlError::AlreadyInitialized`).
-
-**Non-invariant worth flagging.** Regular (non-super) admins are not subject
-to any of this: any existing admin can `add_admin`/`remove_admin` any other
-non-super admin via the `ManageMaintainers` global action — this is an *any
-admin* (OR) authority model, not a threshold. A single compromised
-non-super-admin key is sufficient to add further admin accounts or remove
-peers. See [`THREAT_MODEL.md`](./THREAT_MODEL.md) §1 for the operational
-implications and how this contrasts with `governance-contract`'s M-of-N
-proposal flow.
-
----
-
-## Validation
-
-```bash
-cargo test -p access-control
-cargo test -p treasury-contract
-cargo test -p aid-contract
-cargo test -p referral-contract
-cargo test -p oracle-contract
+```
+canonical(a) == canonical(b)  <=>  a == b   (for the committed field set)
 ```
 
-The referral-contract suite includes explicit cycle-rejection
-(`rejects_invalid_admin_config_and_cycles`, `register_rejects_*`) and
-cap-enforcement tests (`enforces_lifetime_reward_cap_per_referrer`,
-`accrual_math_rejects_overflow`). The access-control `permissions` module's
-own test suite (`every_action_maps_to_one_capability_and_scope`,
-`outsider_is_denied_every_global_action`,
-`role_holder_may_invite_only_into_their_own_role`,
-`inviter_may_cancel_only_their_own_invitation`) directly exercises §4.2.
+**Encoder rules (`shared::canonical`).** The encoder is deterministic and
+depends only on the values of the fields, never on iteration order or on
+host endianness:
+
+1. **Stable field order.** Fields are encoded in the declaration order of the
+   payload struct, and that order is part of the protocol contract. Reordering
+   fields in the struct is a breaking change requiring a new domain tag and a
+   migration note (see §4.4).
+2. **Length-prefixed variable fields.** Every variable-length field
+   (`Symbol`, `String`, `Bytes`, `Vec<T>`) is preficed with its length as a
+   fixed-width `u32` big-endian integer, followed by the bytes. This makes
+   concatenation unambiguous: `("ab", "c")` and `("a", "bc")` encode differently.
+3. **Fixed-width integers in big-endian.** `u64`, `i128`, `u32`, and booleans
+   are encoded big-endian at their native width; booleans are a single byte
+   `0x00`/`0x01`. No host endianness leaks into the encoding.
+4. **Normalized addresses.** `Address` values are encoded as their 32-byte
+   Stellar strut representation (`Address::to_string` is not used), so two
+   representations of the same account cannot diverge. Symbols are normalized to
+   their declared form before encoding.
+5. **Domain separation.** The canonical bytes are prefixed with a
+   domain tag (`Trellis:`<domain>`:v1`) and the contract address before
+   hashing, so a payload signed for one domain (e.g. governance proposal)
+   cannot be replayed as another (e.g. marketplace listing).
+
+**Enforcement call sites.** The following paths hash only through the
+canonical encoder:
+
+- Governance: `proposal_hash()` hashes the canonical encoding of the
+  proposal body plus the proposer address and the creation ledger.
+  Votes are recorded against that hash, and a vote whose recomputed hash
+  differs from the stored one is rejected with `GovernanceError::HashMismatch`.
+- Marketplace: listing and offer signatures are verified over the
+  canonical encoding of the listing/offer struct; a mismatch returns
+  `MarketplaceError::InvalidSignature`.
+- Oracle: the submission digest used for nonce binding is computed over
+  the canonical encoding of `(submitter, feed_id, nonce, price, timestamp,
+  decimals)`, so a replay of any field changes the digest and fails the
+  nonce check in £3.2.
+
+**Regression tests.** `contracts/shared/src/canonical/tests.rs` asserts byte
+equality for equivalent payloads and byte inequality for payloads that differ in
+exactly one committed field. The cases covered include:
+
+- two addresses with the same 32-byte strut but different `to_string()
+  casing produce identical encodings;
+- concatenation ambiguity cases (`("ab","c)` vs `("a","bc")`) produce different
+  encodings;
+- field reordering produces different encodings (guarding the stable
+  order contract);
+- domain tag changes produce different hashes for the same body.
+
+**Operational edge cases and failure modes.**
+
+- **Field order drift.** Any change to a payload struct's field order or type
+  is a protocol-breaking change. Signatures and hashes produced before the
+  change will fail verification after it. Rollback: revert the struct change
+  and re-deploy; if the change is intended, bump the domain tag version and
+  keep the old decoder available for in-flight payloads.
+- **Signature verification failure.** A payload whose recomputed canonical hash
+  does not match the stored hash is rejected before any state mutation. The
+  caller should register the payload again from the original source; there
+  is no partial application to unwind.
+- **Nonce reuse.** A duplicate submission for the same `(submitter, feed_id)`
+  fails with `OracleError::DuplicateSubmission`; the submitter must increment
+  its nonce. There is no rollback path for a submitter that has already
+  advanced its nonce and then lost the payload; the submitter must submit the
+  next nonce with a fresh payload.
+- Payloads that are semantically equal but differ in non-committed
+  metadata (e.g. display labels) are encoded identically; only committed
+  fields affect the hash.
+
+**Rollback / recovery.** The canonical encoder is pure and stateless — a
+rollback is a code revert and redeploy, not a storage migration. Payloads already
+stored under the old encoder remain readable as long as the corresponding
+ domain tag version is retained; the recommended recovery step is to redeploy
+the previous encoder version and re-issue any signatures that failed under
+the new one.
+
+---
+
+## 5. Cross-cutting notes
+
+- The canonical encoder (§4) is the only sactioned way to produce a hash or
+  signing input. Any code path that hashes a payload by any other means is
+  considered a bug against this invariant.
+- The category-balance reconciliation caveat in §1.2 is the most operationally
+  relevant gap in this document; operators should treat treasury category
+  balances as an internal ledger and verify token balances independently.
+- Oracle aggregation enforces quorum and staleness but not a maximum deviation
+  bound; see §3 and [`THREAT_MODEL.md`](./THREAT_MODEL.md).
+- None of the contracts in this document have had a third-party audit.

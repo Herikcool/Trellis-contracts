@@ -51,8 +51,9 @@ commands, the decision points, and the rollback / mitigation paths.
 | Escrow / payments | `PaymentEscrow*` (700–710) | Stuck or double release | §3.6 |
 | Quota / abuse | `QuotaExceeded` (22) by many actors | Legit users blocked | §3.7 |
 | Bulk imports | `BatchTooLarge` (940), `InvalidRow` (944), `DuplicateExternalId` (943) | Failed dataset ingest | §3.8 |
+| Metadata retention | Unminimized leak, premature purge, hold collision | Lost audit / PII leak | §3.9 |
 
-Error codes are defined in [`shared/src/errors.rs`](../shared/src/errors.rs).
+Error codes are defined in [`shared/src/errors.rs`](../shared/src/errors.rs) and [`shared/src/release_readiness.rs`](../shared/src/release_readiness.rs).
 
 ---
 
@@ -113,6 +114,9 @@ cargo test -p shared compat:: -- --nocapture
   record. Redeploy the current build; do **not** hand-edit ledger entries.
 - `SchemaMigrationFailed` on write → validate the record shape and re-run the
   migration path described in [`COMPATIBILITY.md`](./COMPATIBILITY.md).
+- To backfill legacy records or reconcile missing derived indexes, run the
+  operator-safe [Backfill Tool](BACKFILL_TOOL.md):
+  `./scripts/backfill.sh --module <mod> --input <file> [--dry-run | --apply]`.
 
 ### 3.5 Upgrade
 
@@ -156,6 +160,13 @@ soroban contract invoke --id "$CONTRACT_ID" --network "$NETWORK" \
 `set_quota_config`. Treat a broad `QuotaExceeded` spike as an abuse signal and
 escalate to security.
 
+### 3.8 Operational metadata retention & minimization
+
+For operational metadata data minimization reviews, retention enforcement, holds, and testable cleanup procedures across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules, follow [`docs/OPERATIONAL_METADATA_RETENTION.md`](./OPERATIONAL_METADATA_RETENTION.md).
+
+- **Hold emergency**: Place an indefinite hold (`place_operational_hold`) to protect disputed operational metadata from automated cleanup runs.
+- **Accidental override**: Clear or reset custom retention policy override to restore safe compile-time defaults.
+
 ---
 
 ## 4. Persistent storage TTL renewal
@@ -195,6 +206,56 @@ When a bulk import (`import_aids`) encounters invalid rows or duplicate collisio
    to safely skip previously imported records.
 
 See [`IMPORT_PIPELINE.md`](./IMPORT_PIPELINE.md) for complete validation rules and runbooks.
+
+### 3.9 Feature rollout guard & rollback verification
+
+When an alert reports an automatic rollback (`AutomaticRollbackTriggered` 963) or degraded rollout health:
+
+1. **Check Rollout Guard Status**:
+   ```bash
+   soroban contract invoke \
+     --id "$CONTRACT_ID" --network "$NETWORK" --source-account "$READ_ONLY_ACCOUNT" \
+     -- get_guard_config --target "$TARGET_SYMBOL"
+   ```
+   Confirm that `stage` is `RolledBack` and `rollout_bps` is `0`.
+2. **Review Rollback Audit**:
+   Inspect the stored `RollbackAuditRecord` for `reason` (e.g. `ConsecutiveFailuresExceeded`, `ErrorRateBreached`, `InvariantViolation`) and `failing_error_code`.
+3. **Execute Post-Rollback Verification**:
+   ```bash
+   soroban contract invoke \
+     --id "$CONTRACT_ID" --network "$NETWORK" --source-account "$ADMIN_ACCOUNT" \
+     -- verify_rollback --target "$TARGET_SYMBOL"
+   ```
+   Confirm `verified_clean: true`. If `verified_clean: false`, check `anomaly` (such as `SolvencyDiscrepancy` or `OrphanedPartialRecord`) and run module remediation before re-enabling.
+4. **Re-arming Protection**:
+   Do not attempt to re-enable the feature until `verify_rollback` has confirmed a clean state.
+
+See [`FEATURE_FLAG_ROLLOUT_GUARD.md`](./FEATURE_FLAG_ROLLOUT_GUARD.md) for complete details.
+
+### 3.10 Release readiness gate & rollback rehearsal failures
+
+When a pull request, CI pipeline, or release promotion is blocked by the Release Readiness Gate:
+
+1. **Diagnose Gate Blockers**:
+   Execute the release readiness evaluation tool locally to isolate the failing gate:
+   ```bash
+   node scripts/release-readiness-gate.cjs --check-all
+   ```
+2. **Resolve by Gate Type**:
+   - **Migrations Gate (`MissingMigrationVerification`, 971)**:
+     Ensure schema versioning guards are active (`docs/STORAGE_SCHEMA_GUARDS.md`), run `shared::migration::dry_run(&plan)`, and ensure any breaking changes in `changelog/entries.json` contain non-empty `migration_notes`.
+   - **Security Gate (`MissingSecurityCheck`, 972)**:
+     Run `./scripts/security/run-audit.sh`. If an allowlist entry expired in `security/audit-allowlist.toml`, renew or remove it.
+   - **Smoke Tests Gate (`MissingSmokeTest`, 973)**:
+     Run `node scripts/verify-deployment.cjs <network>` to verify cross-contract getters and zero-value simulations across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules.
+   - **Rollback Rehearsals Gate (`MissingRollbackRehearsal`, 974)**:
+     Execute a simulated rollback rehearsal using `shared::release_readiness::rehearse_rollback` proving state preservation upon reverting to previous WASM.
+3. **Emergency Bypass (Incident Only)**:
+   If an emergency hotfix cannot await complete non-critical checks, append the documented exception marker to the PR body:
+   ```markdown
+   <!-- release-readiness-exception: <Incident ID, emergency rationale, and approving tech lead> -->
+   ```
+   See [`RELEASE_READINESS.md`](./RELEASE_READINESS.md) for full gate specifications.
 
 ## 5. Emergency rollback
 
@@ -257,6 +318,7 @@ post-incident note: root cause, detection gap, and follow-up issues.
 
 ## 6. Reference
 
+- [`FEATURE_FLAG_ROLLOUT_GUARD.md`](./FEATURE_FLAG_ROLLOUT_GUARD.md) — feature-flag rollout guard, automatic rollback triggers, and verification receipts.
 - [`IMPORT_PIPELINE.md`](./IMPORT_PIPELINE.md) — bulk import validation, dry-run simulation, and remediation runbooks.
 - [`DIAGNOSTICS.md`](./DIAGNOSTICS.md) — diagnostic tooling details.
 - [`QUOTA.md`](./QUOTA.md) — quota limits and override procedure.

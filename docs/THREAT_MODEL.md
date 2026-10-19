@@ -149,7 +149,74 @@ balance, or treasury bookkeeping and real holdings can silently diverge.
 | Replay a previously accepted submission | Strictly-incrementing per-`(submitter, feed_id)` nonce | `OracleError::DuplicateSubmission` |
 | Backdate or pre-date a submission to game staleness windows | Future-skew (`MAX_FUTURE_SKEW_SECS = 60`) and staleness-window checks on submit and again at aggregation time | `OracleError::SubmissionFromFuture` / `SubmissionStale` |
 | A single submitter moves the reported price alone | Aggregation requires `MIN_PRICE_QUORUM = 2`; median of 1 never publishes | `aggregate_feed_latest` returns `None` under quorum |
-| **Two colluding/compromised submitters move the price arbitrarily far** | **Not mitigated on-chain today** — no deviation-from-prior-median check exists. Raising `MIN_PRICE_QUORUM`, adding a deviation band, or requiring more independent submitters per feed are the available design responses, none of which are implemented yet | `contracts/oracle-contract/src/lib.rs` |
+| **Two colluding/compromised submitters move the price arbitrarily far** | **Not mitigated on-chain today** — no deviation-from-prior-median check exists. Raising `MIN_PRICE_QUORUM`, adding a deviation band, or requiring an independent oracle is the recommended fix. Until then, treat any `FeedLatest` published by exactly `MIN_PRICE_QUORUM` submitters as low-confidence and cross-check against an off-chain reference before acting on it. | `contracts/oracle-contract/src/lib.rs` |
+
+---
+
+## 3. Cross-boundary trust decisions
+
+A *cross-boundary trust decision* is any point where one contract family accepts an assertion produced by another contract family, an off-chain actor, or a different privilege domain, and acts on it without being able to re-derive the assertion itself. The tables above are organized by contract family; this section is organized by the *boundary* being crossed, because the highest-risk failures in this codebase occur at boundaries, not inside a single contract.
+
+### 3.1 Boundary inventory
+
+| Boundary | Assertion crossing it | Who can forge it | Consequence if forged |
+|---|---|---|---|
+| access-control → governance | "this caller holds `Permission::ManageRoles`" | a single compromised admin key | `set_admin_set` shrinks the admin set and threshold to 1 (§1.1) |
+| governance → treasury | "this proposal was approved by `threshold` admins" | a single admin after `set_admin_set` | arbitrary treasury parameter changes |
+| oracle → treasury/aid | "this price is the current median" | 2 colluding submitters | mispriced disbursements, no deviation band (§2.4) |
+| referral → treasury | "this reward is owed to this referrer" | the referral contract itself, if its config is attacker-controlled | `distribute_reward` drains treasury bookkeeping |
+| aid → token | "this transfer succeeded" | a malicious token contract | reentrancy during `claim_aid` (mitigated by CEI, §2.2) |
+| treasury → token | "this withdrawal moved tokens" | **nobody — the call is not made** | bookkeeping diverges from real holdings (§2.2, last row) |
+| off-chain submitter → oracle | "verification occurred off-chain" | any registered submitter | anchored proof of an unverified claim (§1.2) |
+
+### 3.2 Abuse cases
+
+**AC-1 — Single-key governance capture.** An attacker who compromises one admin key holding `ManageRoles` calls `set_admin_set` to reduce the admin set to `{attacker}` and `threshold` to `1`, then executes any proposal alone. *Detection:* a `set_admin_set` event with no preceding `propose`/`approve` pair. *Mitigation today:* rotate the key via `revoke_role` from an uncompromised session; treat the call as high-severity regardless of authorization. *Test:* `governance-contract` should assert that `set_admin_set` cannot be reached without `Permission::ManageRoles`, and that after a threshold reduction a single `approve` is insufficient when `threshold > 1` was the prior value.
+
+**AC-2 — Quorum-minimum oracle push.** Two colluding submitters publish a price far from the prior median. *Detection:* compare each new `FeedLatest` against the previous median and flag deviations beyond an operational band (e.g. 5%). *Mitigation today:* none on-chain; operational cross-check required. *Test:* a unit test that submits two prices differing by >50% and asserts the contract *accepts* them — documenting the gap as a known, tested behavior rather than an untested assumption.
+
+**AC-3 — Treasury bookkeeping divergence.** An operator observes `category_balance` decrease after `withdraw` and assumes tokens moved. *Detection:* reconcile on-chain `category_balance` against the treasury's actual token balance on a schedule. *Mitigation today:* none; the transfer call is absent. *Test:* an integration test asserting that after `withdraw`, the treasury's token balance is *unchanged* — pinning the current behavior so a future fix is a deliberate, reviewed change.
+
+**AC-4 — Referral config self-dealing.** An admin with `ReferralConfiguration` sets tier `bps` summing to 10,000 and routes accrual to a self-controlled referrer. *Detection:* monitor `accrue` calls whose referrer is also the caller's admin. *Mitigation today:* the 10,000 bps cap and per-referrer lifetime cap bound the damage. *Test:* `validate_tier_config` rejects sums >10,000; `credit_referrer` clamps at `reward_cap`.
+
+**AC-5 — Aid reentrancy via malicious token.** A token contract re-enters `claim_aid` during `transfer`. *Detection:* unexpected second `Settled` event for the same aid id. *Mitigation today:* status is written before the transfer (CEI). *Test:* a mock token that re-enters `claim_aid` must observe `AidError::AlreadyClaimed` on the second call.
+
+### 3.3 Highest-risk paths and required checks
+
+The following checks are the minimum executable verification for this threat model. Where the repository already has a test, the check is a pointer; where it does not, the check is the test to add.
+
+1. **`set_admin_set` is not proposal-gated** — add a test asserting a single `ManageRoles` holder can call it directly, and document the result as the accepted risk in §1.1.
+2. **Oracle accepts a >50% deviation** — add a test asserting two submitters can publish an arbitrary price; this is the executable form of AC-2.
+3. **Treasury `withdraw` does not move tokens** — add a test asserting the treasury token balance is unchanged after `withdraw`; this is the executable form of AC-3.
+4. **Aid CEI ordering** — assert a reentrant `claim_aid` fails with `AlreadyClaimed`.
+5. **Referral double-claim** — already covered by `claim_rewards_distributes_from_treasury_and_double_claim_pays_nothing`.
+6. **Access-control super-admin removal** — already covered by the `CannotRemoveSuperAdmin` path.
+
+### 3.4 Operational edge cases and failure modes
+
+| Edge case | Failure mode | Rollback / recovery |
+|---|---|---|
+| Super-admin key lost | No `transfer_ownership` can be initiated; contract is stranded | None on-chain — this is why the super-admin key must be a hardware-backed, backed-up key; see `docs/RUNBOOK.md` §3.2 |
+| `set_admin_set` called unexpectedly | Admin set and threshold silently changed | Re-run `set_admin_set` from an uncompromised admin session to restore the prior set and threshold; rotate all keys that held `ManageRoles` |
+| Oracle publishes a bad median | Downstream disbursements mispriced | Pause treasury (`shared::storage::set_paused`), deactivate the offending submitters via `deactivate_submitter`, re-publish from trusted submitters |
+| Treasury bookkeeping diverges from holdings | `category_balance` no longer reflects real tokens | Halt withdrawals, reconcile off-chain, and correct bookkeeping via a reviewed admin transaction; do not assume `withdraw` moved funds |
+| Aid escrow drained via reentrancy | Double settlement of one aid id | Status is already `Settled`; no rollback needed — the CEI ordering prevents the second transfer |
+| Referral graph cycle past checked depth | Unbounded commission recursion | `accrue`'s own `max_tiers` walk bounds it; no rollback needed, but the edge should be removed via admin config |
+| Ledger close halted | Expiry and staleness guards freeze | No contract-level action; resume when the network resumes. A halted ledger cannot make a pending aid refundable nor an oracle submission stale (§1.3) |
+
+### 3.5 Rollback and recovery steps
+
+1. **Detect** — monitor `ac_ad`/`ac_ar`/`ac_op`/`ac_oa`, governance `RoleGranted`/`RoleRevoked`, and any `set_admin_set` call. Treat unattributed changes as incidents.
+2. **Contain** — pause treasury via `shared::storage::set_paused(true)`; deactivate suspect oracle submitters; revoke suspect roles from an uncompromised admin session.
+3. **Eradicate** — rotate all keys that held the compromised permission; re-run `set_admin_set` to restore the intended admin set and threshold.
+4. **Recover** — reconcile treasury bookkeeping against real token holdings; re-publish oracle feeds from trusted submitters; re-enable treasury by clearing the pause flag.
+5. **Review** — record the incident against the relevant abuse case (AC-1…AC-5) and update this document if a new boundary was crossed.
+
+---
+
+## 4. Compatibility
+
+All mitigations and checks in this document are additive: they add tests, documentation, and operational guidance. No public API, storage schema, event name, or user-facing behavior is changed. Any future fix that *does* change behavior (e.g. adding a deviation band to the oracle, or making `withdraw` actually transfer tokens) must ship with a migration plan and a versioned contract upgrade, and must update this document and `SECURITY_INVARIANTS.md` together.quiring more independent submitters per feed are the available design responses, none of which are implemented yet | `contracts/oracle-contract/src/lib.rs` |
 | Keep an oracle key active after it should be revoked (departed integration, suspected compromise) | Admin-only deactivation, immediately excludes the submitter from future quorum and from the *active-submissions* set used in aggregation | `deactivate_submitter`, checked live in `aggregate_feed_latest` via `is_submitter_active` |
 
 ### 2.5 Governance (takeover)

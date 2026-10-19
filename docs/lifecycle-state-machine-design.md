@@ -46,6 +46,8 @@ pub enum AidStatus {
 ```
 Pending → Settled    (when: recipient claims before expiry)
 Pending → Refunded   (when: donor refunds after expiry)
+Pending → Deactivated (when: admin deactivates an eligible, non-terminal record)
+Deactivated → Pending (when: admin reactivates the record)
 ```
 
 **Invalid Transitions (must be rejected):**

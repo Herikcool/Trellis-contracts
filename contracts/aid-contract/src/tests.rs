@@ -767,6 +767,63 @@ fn test_stable_cursor_pagination_on_aid_contract() {
 }
 
 #[test]
+fn test_cursor_pagination_under_inserts_deletes_and_permission_changes() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let delegate = Address::generate(&fx.env);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut ids = std::vec::Vec::new();
+    for _ in 0..6 {
+        let id = client.create_aid(&fx.donor, &fx.recipient, &100, &expiry, &None);
+        client.grant_search_access(&fx.donor, &id, &delegate);
+        ids.push(id);
+    }
+
+    // Page 1: delegate reads 2 items -> ids[0], ids[1]
+    let page1 = client.search_aids_cursor(&delegate, &None, &2);
+    assert_eq!(page1.records.len(), 2);
+    assert_eq!(page1.records.get(0).unwrap().id, ids[0]);
+    assert_eq!(page1.records.get(1).unwrap().id, ids[1]);
+    assert_eq!(page1.next_cursor, Some(ids[1]));
+    assert!(page1.has_more);
+
+    // Dynamic mutations and permission changes before page 2:
+    // 1. Claim/settle ids[2] (removes from active pending search)
+    client.claim_aid(&ids[2], &fx.recipient);
+
+    // 2. Hide ids[3] by admin
+    client.set_aid_search_visibility(&fx.admin, &ids[3], &false);
+
+    // 3. Revoke delegate's discovery permission on ids[4]
+    client.revoke_search_access(&fx.donor, &ids[4], &delegate);
+
+    // 4. Concurrently insert 2 new aids (ids[6], ids[7]) and grant search access
+    let id6 = client.create_aid(&fx.donor, &fx.recipient, &100, &expiry, &None);
+    client.grant_search_access(&fx.donor, &id6, &delegate);
+    let id7 = client.create_aid(&fx.donor, &fx.recipient, &100, &expiry, &None);
+    client.grant_search_access(&fx.donor, &id7, &delegate);
+
+    // Page 2: with cursor ids[1], limit 2
+    // Must skip ids[2] (claimed), ids[3] (hidden), ids[4] (permission revoked)
+    // and return ids[5] and id6
+    let page2 = client.search_aids_cursor(&delegate, &page1.next_cursor, &2);
+    assert_eq!(page2.records.len(), 2);
+    assert_eq!(page2.records.get(0).unwrap().id, ids[5]);
+    assert_eq!(page2.records.get(1).unwrap().id, id6);
+    assert_eq!(page2.next_cursor, Some(id6));
+    assert!(page2.has_more);
+
+    // Page 3: with cursor id6, limit 2
+    // Must return id7 and terminate
+    let page3 = client.search_aids_cursor(&delegate, &page2.next_cursor, &2);
+    assert_eq!(page3.records.len(), 1);
+    assert_eq!(page3.records.get(0).unwrap().id, id7);
+    assert_eq!(page3.next_cursor, None);
+    assert!(!page3.has_more);
+}
+
+#[test]
 fn test_aid_contract_import_dry_run_and_commit() {
     let fx = setup();
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
@@ -1057,3 +1114,508 @@ fn test_storage_schema_guard_incompatible_versions_fail_safely() {
         Err(Ok(AidError::UnsupportedSchemaVersion))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch Aid Creation Tests (Issue #178)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_batch_create_aid_success() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let initial_donor_balance = token_client.balance(&fx.donor);
+    assert_eq!(initial_donor_balance, MINT_AMOUNT);
+    assert_eq!(token_client.balance(&fx.contract_id), 0);
+
+    let r1 = Address::generate(&fx.env);
+    let r2 = Address::generate(&fx.env);
+    let r3 = Address::generate(&fx.env);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+    allocations.push_back(BatchAidAllocation {
+        recipient: r1.clone(),
+        amount: 150,
+        purpose: symbol_short!("food"),
+        expiry_ledger: expiry,
+    });
+    allocations.push_back(BatchAidAllocation {
+        recipient: r2.clone(),
+        amount: 250,
+        purpose: symbol_short!("medical"),
+        expiry_ledger: expiry,
+    });
+    allocations.push_back(BatchAidAllocation {
+        recipient: r3.clone(),
+        amount: 350,
+        purpose: symbol_short!("shelter"),
+        expiry_ledger: expiry + 50,
+    });
+
+    let total_amount: i128 = 150 + 250 + 350;
+
+    let ids = client.batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.get(0).unwrap(), 0);
+    assert_eq!(ids.get(1).unwrap(), 1);
+    assert_eq!(ids.get(2).unwrap(), 2);
+
+    // Single consolidated token transfer verified
+    assert_eq!(
+        token_client.balance(&fx.donor),
+        initial_donor_balance - total_amount
+    );
+    assert_eq!(token_client.balance(&fx.contract_id), total_amount);
+
+    // Sequential records populated correctly
+    let rec0 = client.get_aid(&0).expect("record 0 must exist");
+    assert_eq!(rec0.id, 0);
+    assert_eq!(rec0.donor, fx.donor);
+    assert_eq!(rec0.recipient, r1);
+    assert_eq!(rec0.token, fx.token_addr);
+    assert_eq!(rec0.amount, 150);
+    assert_eq!(rec0.expiry_ledger, expiry);
+    assert_eq!(rec0.status, AidStatus::Pending);
+
+    let rec1 = client.get_aid(&1).expect("record 1 must exist");
+    assert_eq!(rec1.id, 1);
+    assert_eq!(rec1.donor, fx.donor);
+    assert_eq!(rec1.recipient, r2);
+    assert_eq!(rec1.token, fx.token_addr);
+    assert_eq!(rec1.amount, 250);
+    assert_eq!(rec1.expiry_ledger, expiry);
+    assert_eq!(rec1.status, AidStatus::Pending);
+
+    let rec2 = client.get_aid(&2).expect("record 2 must exist");
+    assert_eq!(rec2.id, 2);
+    assert_eq!(rec2.donor, fx.donor);
+    assert_eq!(rec2.recipient, r3);
+    assert_eq!(rec2.token, fx.token_addr);
+    assert_eq!(rec2.amount, 350);
+    assert_eq!(rec2.expiry_ledger, expiry + 50);
+    assert_eq!(rec2.status, AidStatus::Pending);
+
+    // Donor and recipient indexes populated
+    fx.env.as_contract(&fx.contract_id, || {
+        let donor_aids = storage::get_donor_aids(&fx.env, &fx.donor);
+        assert_eq!(donor_aids.len(), 3);
+        assert_eq!(donor_aids.get(0).unwrap(), 0);
+        assert_eq!(donor_aids.get(1).unwrap(), 1);
+        assert_eq!(donor_aids.get(2).unwrap(), 2);
+
+        let r1_aids = storage::get_recipient_aids(&fx.env, &r1);
+        assert_eq!(r1_aids.len(), 1);
+        assert_eq!(r1_aids.get(0).unwrap(), 0);
+
+        let r2_aids = storage::get_recipient_aids(&fx.env, &r2);
+        assert_eq!(r2_aids.len(), 1);
+        assert_eq!(r2_aids.get(0).unwrap(), 1);
+
+        let r3_aids = storage::get_recipient_aids(&fx.env, &r3);
+        assert_eq!(r3_aids.len(), 1);
+        assert_eq!(r3_aids.get(0).unwrap(), 2);
+    });
+
+    // Recipients can claim their aids
+    client.claim_aid(&0, &r1);
+    assert_eq!(token_client.balance(&r1), 150);
+    assert_eq!(token_client.balance(&fx.contract_id), total_amount - 150);
+    assert_eq!(client.get_aid(&0).unwrap().status, AidStatus::Settled);
+}
+
+#[test]
+fn test_batch_create_aid_max_batch_size_50() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+
+    for _ in 0..MAX_BATCH_SIZE {
+        let recipient = Address::generate(&fx.env);
+        allocations.push_back(BatchAidAllocation {
+            recipient,
+            amount: 10,
+            purpose: symbol_short!("grant"),
+            expiry_ledger: expiry,
+        });
+    }
+
+    assert_eq!(allocations.len(), 50);
+    let ids = client.batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(ids.len(), 50);
+    for i in 0..50 {
+        assert_eq!(ids.get(i).unwrap(), i as u64);
+    }
+
+    assert_eq!(token_client.balance(&fx.contract_id), 500);
+    assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT - 500);
+}
+
+#[test]
+fn test_batch_create_aid_exceeds_max_batch_size_rejected() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+
+    for _ in 0..=MAX_BATCH_SIZE {
+        let recipient = Address::generate(&fx.env);
+        allocations.push_back(BatchAidAllocation {
+            recipient,
+            amount: 10,
+            purpose: symbol_short!("grant"),
+            expiry_ledger: expiry,
+        });
+    }
+
+    assert_eq!(allocations.len(), 51);
+    let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(res, Err(Ok(AidError::BatchTooLarge)));
+
+    // State is pristine
+    assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
+    assert_eq!(token_client.balance(&fx.contract_id), 0);
+    assert_eq!(client.get_aid(&0), None);
+    fx.env.as_contract(&fx.contract_id, || {
+        assert_eq!(storage::get_aid_counter(&fx.env), 0);
+        assert_eq!(storage::get_donor_aids(&fx.env, &fx.donor).len(), 0);
+    });
+}
+
+#[test]
+fn test_batch_create_aid_empty_batch_rejected() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let allocations = Vec::new(&fx.env);
+    let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(res, Err(Ok(AidError::EmptyBatch)));
+
+    assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
+    assert_eq!(token_client.balance(&fx.contract_id), 0);
+    fx.env.as_contract(&fx.contract_id, || {
+        assert_eq!(storage::get_aid_counter(&fx.env), 0);
+    });
+}
+
+#[test]
+fn test_batch_create_aid_invalid_token_rejected() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let wrong_token = Address::generate(&fx.env);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+    allocations.push_back(BatchAidAllocation {
+        recipient: Address::generate(&fx.env),
+        amount: 100,
+        purpose: symbol_short!("food"),
+        expiry_ledger: expiry,
+    });
+
+    let res = client.try_batch_create_aid(&fx.donor, &wrong_token, &allocations);
+    assert_eq!(res, Err(Ok(AidError::InvalidArgument)));
+}
+
+#[test]
+fn test_batch_create_aid_atomicity_and_rollback_on_invalid_amount() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+
+    // 3 valid entries, 1 invalid (0 amount), 1 valid
+    for i in 0..5 {
+        let recipient = Address::generate(&fx.env);
+        let amount = if i == 3 { 0 } else { 100 };
+        allocations.push_back(BatchAidAllocation {
+            recipient,
+            amount,
+            purpose: symbol_short!("relief"),
+            expiry_ledger: expiry,
+        });
+    }
+
+    let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(res, Err(Ok(AidError::InvalidArgument)));
+
+    // Full atomic rollback verification:
+    // No funds moved, no counter incremented, no records created
+    assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
+    assert_eq!(token_client.balance(&fx.contract_id), 0);
+    for i in 0..5 {
+        assert_eq!(client.get_aid(&i), None);
+    }
+    fx.env.as_contract(&fx.contract_id, || {
+        assert_eq!(storage::get_aid_counter(&fx.env), 0);
+        assert_eq!(storage::get_donor_aids(&fx.env, &fx.donor).len(), 0);
+        assert_eq!(storage::get_search_index(&fx.env).len(), 0);
+    });
+}
+
+#[test]
+fn test_batch_create_aid_atomicity_and_rollback_on_negative_amount() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+    allocations.push_back(BatchAidAllocation {
+        recipient: Address::generate(&fx.env),
+        amount: 100,
+        purpose: symbol_short!("relief"),
+        expiry_ledger: expiry,
+    });
+    allocations.push_back(BatchAidAllocation {
+        recipient: Address::generate(&fx.env),
+        amount: -50,
+        purpose: symbol_short!("relief"),
+        expiry_ledger: expiry,
+    });
+
+    let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(res, Err(Ok(AidError::InvalidArgument)));
+
+    assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
+    assert_eq!(token_client.balance(&fx.contract_id), 0);
+    assert_eq!(client.get_aid(&0), None);
+}
+
+#[test]
+fn test_batch_create_aid_atomicity_and_rollback_on_expired_ledger() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    let current = fx.env.ledger().sequence();
+    let mut allocations = Vec::new(&fx.env);
+
+    // First allocation valid
+    allocations.push_back(BatchAidAllocation {
+        recipient: Address::generate(&fx.env),
+        amount: 100,
+        purpose: symbol_short!("aid"),
+        expiry_ledger: current + 100,
+    });
+    // Second allocation has expired ledger
+    allocations.push_back(BatchAidAllocation {
+        recipient: Address::generate(&fx.env),
+        amount: 200,
+        purpose: symbol_short!("aid"),
+        expiry_ledger: current, // <= current_ledger is invalid
+    });
+
+    let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(res, Err(Ok(AidError::InvalidArgument)));
+
+    // Revert verified
+    assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
+    assert_eq!(token_client.balance(&fx.contract_id), 0);
+    assert_eq!(client.get_aid(&0), None);
+    fx.env.as_contract(&fx.contract_id, || {
+        assert_eq!(storage::get_aid_counter(&fx.env), 0);
+    });
+}
+
+#[test]
+fn test_batch_create_aid_paused_contract_rejected() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+
+    client.set_paused(&fx.admin, &true);
+
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let mut allocations = Vec::new(&fx.env);
+    allocations.push_back(BatchAidAllocation {
+        recipient: Address::generate(&fx.env),
+        amount: 100,
+        purpose: symbol_short!("food"),
+        expiry_ledger: expiry,
+    });
+
+    let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+    assert_eq!(res, Err(Ok(AidError::Paused)));
+}
+
+#[test]
+fn test_batch_create_aid_fuzz_validation_and_atomicity() {
+    // Deterministic pseudo-random fuzz runner testing varying batch configurations
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+    // Simple pseudo-random LCG for deterministic test generation
+    let mut seed: u64 = 0xdeadbeef_cafebabe;
+    let mut next_rand = |max: u32| -> u32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 32) as u32) % max
+    };
+
+    let mut expected_created_total: u64 = 0;
+    let mut expected_contract_balance: i128 = 0;
+
+    for iteration in 0..25 {
+        let size = next_rand(60); // 0..59
+        let inject_bad_amount = (iteration % 3) == 0;
+        let inject_bad_expiry = (iteration % 5) == 0;
+        let bad_index = if size > 0 { next_rand(size) } else { 0 };
+
+        let current_ledger = fx.env.ledger().sequence();
+        let mut allocations = Vec::new(&fx.env);
+        let mut batch_sum: i128 = 0;
+
+        for i in 0..size {
+            let amount: i128 = if inject_bad_amount && i == bad_index {
+                if (iteration % 2) == 0 { 0 } else { -10 }
+            } else {
+                ((next_rand(100) + 1) * 10) as i128
+            };
+
+            let expiry_ledger: u32 = if inject_bad_expiry && i == bad_index {
+                current_ledger // expired
+            } else {
+                current_ledger + 100 + next_rand(1000)
+            };
+
+            allocations.push_back(BatchAidAllocation {
+                recipient: Address::generate(&fx.env),
+                amount,
+                purpose: symbol_short!("test"),
+                expiry_ledger,
+            });
+
+            batch_sum += amount;
+        }
+
+        let is_valid = size > 0 && size <= MAX_BATCH_SIZE && !inject_bad_amount && !inject_bad_expiry;
+
+        let donor_balance_before = token_client.balance(&fx.donor);
+        let contract_balance_before = token_client.balance(&fx.contract_id);
+        let counter_before = fx.env.as_contract(&fx.contract_id, || {
+            storage::get_aid_counter(&fx.env)
+        });
+
+        let res = client.try_batch_create_aid(&fx.donor, &fx.token_addr, &allocations);
+
+        if is_valid {
+            assert!(res.is_ok(), "Valid batch must succeed at iteration {}", iteration);
+            let ids = res.unwrap().unwrap();
+            assert_eq!(ids.len(), size);
+
+            expected_contract_balance += batch_sum;
+            assert_eq!(token_client.balance(&fx.contract_id), expected_contract_balance);
+            assert_eq!(token_client.balance(&fx.donor), donor_balance_before - batch_sum);
+
+            for i in 0..size {
+                let id = ids.get(i).unwrap();
+                assert_eq!(id, expected_created_total + i as u64);
+                let rec = client.get_aid(&id).expect("record must exist");
+                assert_eq!(rec.amount, allocations.get(i).unwrap().amount);
+                assert_eq!(rec.status, AidStatus::Pending);
+            }
+            expected_created_total += size as u64;
+        } else {
+            // Must have failed and rolled back completely
+            assert!(res.is_err(), "Invalid batch must fail at iteration {}", iteration);
+            assert_eq!(
+                token_client.balance(&fx.donor),
+                donor_balance_before,
+                "Donor balance must be unchanged on failure at iteration {}",
+                iteration
+            );
+            assert_eq!(
+                token_client.balance(&fx.contract_id),
+                contract_balance_before,
+                "Contract balance must be unchanged on failure at iteration {}",
+                iteration
+            );
+            let counter_after = fx.env.as_contract(&fx.contract_id, || {
+                storage::get_aid_counter(&fx.env)
+            });
+            assert_eq!(
+                counter_after,
+                counter_before,
+                "Counter must not advance on failure at iteration {}",
+                iteration
+            );
+        }
+    }
+}
+
+#[test]
+fn test_stress_bucketed_pagination_no_unbounded_vectors() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+
+    // Create 125 aids (50 in page 0, 50 in page 1, 25 in page 2)
+    let ids = create_aids(&fx.env, &client, &fx.donor, &fx.recipient, 125);
+    assert_eq!(ids.len(), 125);
+
+    fx.env.as_contract(&fx.contract_id, || {
+        // Donor aids pagination checks
+        let donor_count = storage::get_donor_aid_count(&fx.env, &fx.donor);
+        assert_eq!(donor_count, 125);
+
+        let page0 = storage::get_donor_aids_page(&fx.env, &fx.donor, 0);
+        let page1 = storage::get_donor_aids_page(&fx.env, &fx.donor, 1);
+        let page2 = storage::get_donor_aids_page(&fx.env, &fx.donor, 2);
+        let page3 = storage::get_donor_aids_page(&fx.env, &fx.donor, 3);
+
+        assert_eq!(page0.len(), 50);
+        assert_eq!(page1.len(), 50);
+        assert_eq!(page2.len(), 25);
+        assert_eq!(page3.len(), 0);
+
+        let all_donor_aids = storage::get_donor_aids(&fx.env, &fx.donor);
+        assert_eq!(all_donor_aids.len(), 125);
+
+        // Recipient aids pagination checks
+        let recipient_count = storage::get_recipient_aid_count(&fx.env, &fx.recipient);
+        assert_eq!(recipient_count, 125);
+
+        let r_page0 = storage::get_recipient_aids_page(&fx.env, &fx.recipient, 0);
+        let r_page1 = storage::get_recipient_aids_page(&fx.env, &fx.recipient, 1);
+        let r_page2 = storage::get_recipient_aids_page(&fx.env, &fx.recipient, 2);
+        let r_page3 = storage::get_recipient_aids_page(&fx.env, &fx.recipient, 3);
+
+        assert_eq!(r_page0.len(), 50);
+        assert_eq!(r_page1.len(), 50);
+        assert_eq!(r_page2.len(), 25);
+        assert_eq!(r_page3.len(), 0);
+
+        let all_recipient_aids = storage::get_recipient_aids(&fx.env, &fx.recipient);
+        assert_eq!(all_recipient_aids.len(), 125);
+
+        // Search index bucketing checks
+        let mut index_vec = soroban_sdk::Vec::new(&fx.env);
+        for id in 0..125u64 {
+            index_vec.push_back(id);
+        }
+        storage::set_search_index(&fx.env, &index_vec);
+
+        let search_count = storage::get_search_index_count(&fx.env);
+        assert_eq!(search_count, 125);
+
+        let s_page0 = storage::get_search_index_page(&fx.env, 0);
+        let s_page1 = storage::get_search_index_page(&fx.env, 1);
+        let s_page2 = storage::get_search_index_page(&fx.env, 2);
+
+        assert_eq!(s_page0.len(), 50);
+        assert_eq!(s_page1.len(), 50);
+        assert_eq!(s_page2.len(), 25);
+
+        let all_search = storage::get_search_index(&fx.env);
+        assert_eq!(all_search.len(), 125);
+    });
+}
+

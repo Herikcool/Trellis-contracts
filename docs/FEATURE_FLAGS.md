@@ -80,9 +80,26 @@ A missing flag config means enforcement stays on (the safer behavior). The
 default (disabled) state is covered by the existing quota tests plus the new
 `feature_flag_bypass_skips_enforcement_and_rolls_back` test.
 
+The helper returns an explicit `GateDecision`: `Legacy` for a missing or
+disabled flag and `Enabled` only after an administrator has written an enabled
+configuration. Contract paths should switch on this decision rather than
+treating a missing storage value as enabled. The rollback test verifies the
+decision returns to `Legacy` after `emergency_disable`.
+
+## Automated Rollout Guard & Rollback Verification (Issue #239)
+
+For advanced staged deployments across Treasury, Aid, Referral, Governance, Oracle, and Marketplace, see [`FEATURE_FLAG_ROLLOUT_GUARD.md`](./FEATURE_FLAG_ROLLOUT_GUARD.md).
+
+Key capabilities added in Issue #239:
+- **Telemetry Monitoring**: Automatic tracking of invocation counts, failure spikes, and error rates in basis points.
+- **Automatic Rollback**: The guard automatically trips emergency rollback when consecutive errors or error rate limits are breached, zeroing rollout weight immediately.
+- **Rollback Verification**: Proves that post-rollback state is clean and consistent (no orphaned records, solvency maintained, legacy fallback confirmed).
+- **Re-Arming Guardrails**: Prevents re-enabling a rolled-back feature until clean verification is established.
+
 ## Validation
 
 ```bash
 cargo test -p shared feature_flags
+cargo test -p shared rollout_guard
 cargo test -p shared quota
 ```

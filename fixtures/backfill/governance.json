@@ -1,0 +1,26 @@
+[
+  {
+    "type": "parameter",
+    "key": "AidDefaultExpiry",
+    "value": "604800"
+  },
+  {
+    "type": "parameter",
+    "key": "TreasuryWithdrawalLimit",
+    "value": "100000000000"
+  },
+  {
+    "type": "parameter",
+    "key": "ReferralTierBps_1",
+    "value": "500"
+  },
+  {
+    "type": "admin_set",
+    "admins": [
+      "GBV7F3X3QJ7L6G5U2R7V6Q5U2R7V6Q5U2R7V6Q5U2R7V6Q5U2R7V6Q5U",
+      "GDG44Y6F7NKGXW2H3PZ4Y6F7NKGXW2H3PZ4Y6F7NKGXW2H3PZ4Y6F7N"
+    ],
+    "threshold": 2,
+    "quorum_bps": 6000
+  }
+]

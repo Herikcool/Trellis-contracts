@@ -22,8 +22,8 @@ use shared::auth;
 use shared::errors::Error;
 use shared::events::emit_action_executed;
 use shared::payments::{
-    self, create_escrow, get_escrow, refund_escrow, release_escrow, safe_transfer_from_contract,
-    EscrowRecord,
+    self, create_escrow, get_escrow, refund_escrow, release_escrow, release_milestone,
+    resolve_dispute, safe_transfer_from_contract, EscrowRecord,
 };
 use shared::storage::{instance_get, instance_set};
 
@@ -361,6 +361,37 @@ impl ExamplePaymentsContract {
         get_escrow(&env, escrow_id)
     }
 
+    /// Release a milestone amount from an escrow deposit. Admin only.
+    pub fn release_milestone_entry(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        let token = get_escrow(&env, escrow_id)
+            .ok_or(Error::PaymentEscrowNotFound)?
+            .token;
+
+        release_milestone(&env, &token, escrow_id, amount)
+    }
+
+    /// Resolve a dispute by splitting escrowed funds. Admin only.
+    pub fn resolve_dispute_entry(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        beneficiary_amount: i128,
+        refund_amount: i128,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        let token = get_escrow(&env, escrow_id)
+            .ok_or(Error::PaymentEscrowNotFound)?
+            .token;
+
+        resolve_dispute(&env, &token, escrow_id, beneficiary_amount, refund_amount)
+    }
+
     // -----------------------------------------------------------------------
     // Batch payouts
     // -----------------------------------------------------------------------
@@ -404,4 +435,121 @@ fn require_supported_token(env: &Env, token: &Address) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{Env, IntoVal};
+
+    #[test]
+    fn test_milestone_release_partial_amounts() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ExamplePaymentsContract);
+        let client = ExamplePaymentsContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        client.initialize(&admin, &token, &0, &Address::generate(&env));
+        client.add_supported_token(&admin, &token);
+
+        // Create escrow
+        let escrow_id = client.create_escrow_entry(
+            &depositor,
+            &beneficiary,
+            &token,
+            &1000,
+            &1000,
+        );
+
+        // Release first milestone
+        client.release_milestone_entry(&admin, &escrow_id, &200).unwrap();
+
+        let escrow = client.get_escrow_entry(&escrow_id).unwrap();
+        assert_eq!(escrow.released_amount, 200);
+        assert_eq!(escrow.amount, 1000);
+
+        // Release second milestone
+        client.release_milestone_entry(&admin, &escrow_id, &300).unwrap();
+
+        let escrow = client.get_escrow_entry(&escrow_id).unwrap();
+        assert_eq!(escrow.released_amount, 500);
+    }
+
+    #[test]
+    fn test_dispute_resolution_split_funds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ExamplePaymentsContract);
+        let client = ExamplePaymentsContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        client.initialize(&admin, &token, &0, &Address::generate(&env));
+        client.add_supported_token(&admin, &token);
+
+        // Create escrow
+        let escrow_id = client.create_escrow_entry(
+            &depositor,
+            &beneficiary,
+            &token,
+            &1000,
+            &1000,
+        );
+
+        // Resolve dispute with 60/40 split
+        client.resolve_dispute_entry(&admin, &escrow_id, &600, &400).unwrap();
+
+        let escrow = client.get_escrow_entry(&escrow_id).unwrap();
+        assert_eq!(escrow.released_amount, 600);
+        assert_eq!(escrow.refunded_amount, 400);
+        assert_eq!(escrow.state, shared::payments::EscrowState::Released);
+    }
+
+    #[test]
+    fn test_value_conservation_invariant() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ExamplePaymentsContract);
+        let client = ExamplePaymentsContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let depositor = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+
+        client.initialize(&admin, &token, &0, &Address::generate(&env));
+        client.add_supported_token(&admin, &token);
+
+        // Create escrow
+        let escrow_id = client.create_escrow_entry(
+            &depositor,
+            &beneficiary,
+            &token,
+            &1000,
+            &1000,
+        );
+
+        // Release partial amount
+        client.release_milestone_entry(&admin, &escrow_id, &300).unwrap();
+
+        let escrow = client.get_escrow_entry(&escrow_id).unwrap();
+        let remaining = escrow.amount - escrow.released_amount - escrow.refunded_amount;
+        assert_eq!(remaining, 700);
+
+        // Resolve dispute
+        client.resolve_dispute_entry(&admin, &escrow_id, &400, &300).unwrap();
+
+        let escrow = client.get_escrow_entry(&escrow_id).unwrap();
+        let total = escrow.released_amount + escrow.refunded_amount;
+        assert_eq!(total, escrow.amount);
+    }
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "category": "reserve",
+    "balance": "10000000000000"
+  },
+  {
+    "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "category": "rewards",
+    "balance": "500000000000"
+  },
+  {
+    "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "category": "yield",
+    "balance": "250000000000"
+  },
+  {
+    "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "category": "invalid_negative",
+    "balance": "-100"
+  }
+]

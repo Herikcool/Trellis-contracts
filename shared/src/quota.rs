@@ -186,7 +186,10 @@ pub fn check_and_consume(
     // Emergency kill switch: maintainers can enable the quota-bypass feature
     // flag to skip enforcement during an incident. A missing flag config falls
     // back to enforcing quotas (the safer behavior).
-    if crate::feature_flags::is_enabled(env, &crate::feature_flags::FeatureFlag::QuotaBypass) {
+    if matches!(
+        crate::feature_flags::decide(env, &crate::feature_flags::FeatureFlag::QuotaBypass),
+        crate::feature_flags::GateDecision::Enabled
+    ) {
         return Ok(get_usage(env, actor, resource));
     }
     let Some(cfg) = get_quota_config(env, resource) else {

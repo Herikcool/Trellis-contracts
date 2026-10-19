@@ -5,6 +5,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod concurrency;
 pub mod examples;
 pub mod fault_injection;
 pub mod fuzzing;
@@ -16,6 +19,8 @@ pub mod sandbox;
 pub mod simulation;
 pub mod snapshot;
 pub mod upgrade;
+#[cfg(test)]
+mod amount_properties;
 
 pub use fuzzing::*;
 pub use helpers::*;

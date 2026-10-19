@@ -2306,4 +2306,163 @@ mod tests {
             Err(Ok(AccessControlError::SelfReference))
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Emergency circuit breaker
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn admin_can_pause_a_scope_and_pauser_is_recorded() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let scope = symbol_short!("roles");
+        let paused_at = 1_700_000_000_u64;
+        env.ledger().set_timestamp(paused_at);
+
+        assert!(!client.is_paused(&scope));
+
+        client.pause(&super_admin, &scope);
+
+        assert!(client.is_paused(&scope));
+
+        let paused_by: Option<Address> = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&DataKey::PausedBy(scope.clone()))
+        });
+        let recorded_at: Option<u64> = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&DataKey::PausedAt(scope.clone()))
+        });
+        assert_eq!(paused_by, Some(super_admin));
+        assert_eq!(recorded_at, Some(paused_at));
+    }
+
+    #[test]
+    fn admin_can_resume_a_paused_scope_and_state_is_cleared() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let scope = symbol_short!("roles");
+
+        client.pause(&super_admin, &scope);
+        assert!(client.is_paused(&scope));
+
+        client.resume(&super_admin, &scope);
+
+        assert!(!client.is_paused(&scope));
+        let cleared = env.as_contract(&contract_id, || {
+            let paused_by: Option<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PausedBy(scope.clone()));
+            let paused_at: Option<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PausedAt(scope.clone()));
+            paused_by.is_none() && paused_at.is_none()
+        });
+        assert!(cleared);
+    }
+
+    #[test]
+    fn pausing_one_scope_leaves_other_scopes_running() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let roles = symbol_short!("roles");
+        let admins = symbol_short!("admins");
+        let invites = symbol_short!("invites");
+
+        client.pause(&super_admin, &roles);
+
+        assert!(client.is_paused(&roles));
+        assert!(!client.is_paused(&admins));
+        assert!(!client.is_paused(&invites));
+    }
+
+    #[test]
+    fn non_admin_cannot_pause_or_resume() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let stranger = Address::generate(&env);
+        let scope = symbol_short!("roles");
+
+        assert_eq!(
+            client.try_pause(&stranger, &scope),
+            Err(Ok(AccessControlError::NotAdmin))
+        );
+        assert!(!client.is_paused(&scope));
+
+        client.pause(&super_admin, &scope);
+        assert_eq!(
+            client.try_resume(&stranger, &scope),
+            Err(Ok(AccessControlError::NotAdmin))
+        );
+        // The unauthorized resume attempt must not clear the pause.
+        assert!(client.is_paused(&scope));
+    }
+
+    #[test]
+    fn pause_and_resume_reject_invalid_arguments_and_duplicates() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let scope = symbol_short!("roles");
+        let bogus = symbol_short!("bogus");
+
+        assert_eq!(
+            client.try_pause(&super_admin, &bogus),
+            Err(Ok(AccessControlError::InvalidPauseScope))
+        );
+        assert_eq!(
+            client.try_resume(&super_admin, &bogus),
+            Err(Ok(AccessControlError::InvalidPauseScope))
+        );
+
+        // Resuming something that was never paused is an error.
+        assert_eq!(
+            client.try_resume(&super_admin, &scope),
+            Err(Ok(AccessControlError::NotPaused))
+        );
+
+        // Pausing twice is an error.
+        client.pause(&super_admin, &scope);
+        assert_eq!(
+            client.try_pause(&super_admin, &scope),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_are_audited_with_state_transitions() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let scope = symbol_short!("roles");
+
+        client.pause(&super_admin, &scope);
+        client.resume(&super_admin, &scope);
+
+        // Newest first: resume (1 -> 0) then pause (0 -> 1).
+        let audit = client.audit_trail(&super_admin, &10);
+
+        let resume = audit.get(0).unwrap();
+        assert_eq!(resume.actor, super_admin);
+        assert_eq!(resume.scope, symbol_short!("access"));
+        assert_eq!(resume.action, symbol_short!("resume"));
+        assert_eq!(resume.reason, symbol_short!("breaker"));
+        assert_eq!(resume.resource, None);
+        assert_eq!(resume.attribute, Some(scope.clone()));
+        assert_eq!(resume.before, Some(1));
+        assert_eq!(resume.after, Some(0));
+
+        let pause = audit.get(1).unwrap();
+        assert_eq!(pause.actor, super_admin);
+        assert_eq!(pause.scope, symbol_short!("access"));
+        assert_eq!(pause.action, symbol_short!("pause"));
+        assert_eq!(pause.reason, symbol_short!("breaker"));
+        assert_eq!(pause.resource, None);
+        assert_eq!(pause.attribute, Some(scope.clone()));
+        assert_eq!(pause.before, Some(0));
+        assert_eq!(pause.after, Some(1));
+    }
+
 }

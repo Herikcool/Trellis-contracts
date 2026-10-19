@@ -118,3 +118,9 @@ The suite covers: classification, default/override policies, dry-run
 non-destructiveness, the confirmation requirement, protected vs. eligible
 records, holds placed after planning, lapsed and released holds, frozen
 classes surviving a forged plan, and invalid inputs.
+
+## Operational metadata retention & minimization
+
+For operational metadata data minimization reviews, module-level classification
+(Treasury, Aid, Referral, Governance, Oracle, Marketplace), and testable deletion
+workflows, see [`docs/OPERATIONAL_METADATA_RETENTION.md`](./OPERATIONAL_METADATA_RETENTION.md).

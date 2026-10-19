@@ -35,6 +35,28 @@ pub enum FeatureFlagError {
     InvalidRollout = 960,
     /// The requested behavior is disabled (or has not been enabled yet).
     Disabled = 961,
+    /// Rollout guard blocked execution due to degraded health or critical state.
+    GuardBlocked = 962,
+    /// Automatic rollback was triggered due to consecutive failures or invariant violations.
+    AutomaticRollbackTriggered = 963,
+    /// Rollback verification failed to confirm clean state.
+    RollbackVerificationFailed = 964,
+    /// Inconsistent state was detected during rollback verification.
+    InconsistentStateDetected = 965,
+    /// The target is already in a rolled-back state.
+    AlreadyRolledBack = 966,
+    /// The rollout guard configuration is invalid.
+    InvalidGuardConfig = 967,
+    /// Re-enabling a rolled-back target requires successful rollback verification first.
+    UnverifiedRollbackReenableForbidden = 968,
+}
+
+/// Branch decision for a gated contract path. A missing or disabled flag must
+/// remain on the safe legacy path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateDecision {
+    Legacy,
+    Enabled,
 }
 
 /// Typed set of feature flags. Add a variant to introduce a new switch.
@@ -49,6 +71,16 @@ pub enum FeatureFlag {
     EscrowReleaseV2,
     /// Gates the V2 referral payout path.
     ReferralPayoutV2,
+    /// Gates V2 automated treasury sweep and category balance rebalancing.
+    TreasurySweepV2,
+    /// Gates V2 batch aid disbursement and verification pipeline.
+    AidDisbursementV2,
+    /// Gates V2 governance snapshot voting and proposal execution.
+    GovernanceVotingV2,
+    /// Gates V2 oracle price feed medianizer and quorum verification.
+    OracleMedianizerV2,
+    /// Gates V2 marketplace batch listing and royalty settlement.
+    MarketplaceAuctionV2,
 }
 
 /// Stored configuration for a single flag.
@@ -133,6 +165,11 @@ pub fn require_enabled(env: &Env, flag: &FeatureFlag) -> Result<(), FeatureFlagE
     }
 }
 
+/// Select the safe legacy path or the explicitly enabled path.
+pub fn decide(env: &Env, flag: &FeatureFlag) -> GateDecision {
+    if is_enabled(env, flag) { GateDecision::Enabled } else { GateDecision::Legacy }
+}
+
 /// Enable/disable a flag and/or set its staged-rollout weight.
 ///
 /// Disabling a flag always zeroes `rollout_bps` so a later re-enable starts
@@ -179,6 +216,21 @@ pub fn flag_status(env: &Env, flag: &FeatureFlag) -> FeatureFlagStatus {
         enabled_now,
     }
 }
+
+/// Evaluates the rollout guard for a typed feature flag with deterministic caller seed.
+pub fn guard_flag(env: &Env, flag: FeatureFlag, caller_seed: u32) -> crate::rollout_guard::GuardDecision {
+    crate::rollout_guard::evaluate_rollout_guard(env, crate::rollout_guard::RolloutTarget::Flag(flag), caller_seed)
+}
+
+pub use crate::rollout_guard::{
+    default_guard_config, evaluate_rollout_guard, get_guard_config, get_health_metrics,
+    get_last_rollback_audit, get_last_verification_receipt, init_or_update_guard,
+    is_rollback_verified, rearm_after_verified_rollback, record_execution_outcome,
+    trigger_auto_rollback, verify_rollback, GuardDecision, GuardHealthStatus,
+    ModuleConsistencySnapshot, RollbackAuditRecord, RollbackReason, RollbackVerificationReceipt,
+    RolloutGuardConfig, RolloutHealthMetrics, RolloutModule, RolloutStage, RolloutTarget,
+    StateAnomalyKind,
+};
 
 #[cfg(test)]
 mod tests {
@@ -261,5 +313,16 @@ mod tests {
         let status = flag_status(&env, &flag);
         assert!(status.enabled_now);
         assert_eq!(status.config.rollout_bps, 5_000);
+    }
+
+    #[test]
+    fn decision_defaults_to_legacy_and_rolls_back_to_legacy() {
+        let env = Env::default();
+        let flag = FeatureFlag::QuotaBypass;
+        assert_eq!(decide(&env, &flag), GateDecision::Legacy);
+        set_flag(&env, &flag, true, FULL_ROLLOUT_BPS).unwrap();
+        assert_eq!(decide(&env, &flag), GateDecision::Enabled);
+        emergency_disable(&env, &flag);
+        assert_eq!(decide(&env, &flag), GateDecision::Legacy);
     }
 }

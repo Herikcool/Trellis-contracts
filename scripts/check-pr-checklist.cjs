@@ -31,7 +31,7 @@
 
 const fs = require("fs");
 
-const REQUIRE_ALL_SECTIONS = ["Checklist", "On-chain Interface"];
+const REQUIRE_ALL_SECTIONS = ["Checklist", "On-chain Interface", "Release Readiness Gate"];
 const REQUIRE_ANY_SECTIONS = ["Type of Change"];
 const EXCEPTION_RE = /<!--\s*release-readiness-exception:\s*(.+?)\s*-->/i;
 

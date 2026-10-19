@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+﻿use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
 use crate::errors::Error;
 use crate::storage::{persistent_has, persistent_set};
 use crate::utils::now;
@@ -23,7 +23,7 @@ pub enum ReplayKey {
 }
 
 /// Validates a signed payload and marks it as consumed to prevent replays.
-///
+/// 
 /// Rejects expired payloads, mismatched scopes, and replays.
 /// Assumes signer.require_auth() has already been called or will be called by the caller
 /// (but calls it here for safety as well if it's the right place, wait no).

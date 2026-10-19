@@ -24,3 +24,6 @@ jobs:
 
       - name: Check the readiness checklist
         run: node scripts/check-pr-checklist.cjs --body-file pr-body.md
+
+      - name: Verify release readiness gate (migrations, security, smoke tests, rollback rehearsals)
+        run: node scripts/release-readiness-gate.cjs --check-all
