@@ -244,4 +244,36 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn defers_until_drift_exits_hysteresis_band() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::MultiAssetRebalancer);
+        let client = crate::MultiAssetRebalancerClient::new(&env, &contract);
+
+        assert_eq!(
+            client.decide_rebalance(&99, &100, &10, &20),
+            crate::RebalanceDecision::DeferredForDrift
+        );
+        assert_eq!(
+            client.decide_rebalance(&100, &100, &10, &20),
+            crate::RebalanceDecision::Execute
+        );
+    }
+
+    #[test]
+    fn defers_when_estimated_gas_exceeds_budget() {
+        let env = Env::default();
+        let contract = env.register_contract(None, crate::MultiAssetRebalancer);
+        let client = crate::MultiAssetRebalancerClient::new(&env, &contract);
+
+        assert_eq!(
+            client.decide_rebalance(&250, &100, &21, &20),
+            crate::RebalanceDecision::DeferredForGas
+        );
+        assert_eq!(
+            client.decide_rebalance(&250, &100, &20, &20),
+            crate::RebalanceDecision::Execute
+        );
+    }
 }

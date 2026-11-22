@@ -115,6 +115,15 @@ pub struct SimulationResult {
     pub expected_slippage: U256,
 }
 
+/// The planner's decision before submitting a rebalance transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RebalanceDecision {
+    Execute,
+    DeferredForDrift,
+    DeferredForGas,
+}
+
 #[contract]
 pub struct MultiAssetRebalancer;
 
@@ -168,6 +177,26 @@ impl MultiAssetRebalancer {
             .instance()
             .set(&StorageKey::Capacity(asset_in, asset_out), &capacity);
         Ok(())
+    }
+
+    /// Apply a hysteresis band to portfolio drift and defer work whose
+    /// estimated cost exceeds the caller's current gas budget. Equality at
+    /// the drift threshold is intentional: it makes the trigger stable at
+    /// the boundary instead of oscillating between two decisions.
+    pub fn decide_rebalance(
+        _env: Env,
+        portfolio_drift_bps: u32,
+        hysteresis_bps: u32,
+        estimated_gas: u64,
+        gas_budget: u64,
+    ) -> RebalanceDecision {
+        if portfolio_drift_bps < hysteresis_bps {
+            RebalanceDecision::DeferredForDrift
+        } else if estimated_gas > gas_budget {
+            RebalanceDecision::DeferredForGas
+        } else {
+            RebalanceDecision::Execute
+        }
     }
 
     pub fn rebalance(
