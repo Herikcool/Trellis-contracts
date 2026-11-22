@@ -420,6 +420,46 @@ impl ExamplePaymentsContract {
         shared::payments::multi_transfer_all(&env, &contract_addr, &token, &rust_vec).unwrap()
     }
 
+    /// Settle a payment using the preferred token, or the fallback token when
+    /// the preferred reserve cannot cover the requested amount.
+    ///
+    /// Reserve checks happen before the cross-contract transfer, so an
+    /// unavailable preferred asset selects the fallback without relying on a
+    /// reverted token call. The selected token is returned for auditability
+    /// and safe client retries.
+    pub fn settle_with_fallback(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        preferred_token: Address,
+        fallback_token: Address,
+        amount: i128,
+    ) -> Result<Address, Error> {
+        auth::require_admin(&env, &caller)?;
+        if amount <= 0 {
+            return Err(Error::PaymentInvalidAmount);
+        }
+        require_supported_token(&env, &preferred_token)?;
+        require_supported_token(&env, &fallback_token)?;
+
+        let contract_addr = env.current_contract_address();
+        let preferred_balance =
+            soroban_sdk::token::Client::new(&env, &preferred_token).balance(&contract_addr);
+        let selected_token = if preferred_balance >= amount {
+            preferred_token
+        } else {
+            let fallback_balance =
+                soroban_sdk::token::Client::new(&env, &fallback_token).balance(&contract_addr);
+            if fallback_balance < amount {
+                return Err(Error::PaymentInsufficientBalance);
+            }
+            fallback_token
+        };
+
+        safe_transfer_from_contract(&env, &selected_token, &recipient, amount)?;
+        Ok(selected_token)
+    }
+
     /// Returns the configured token address.
     pub fn get_token(env: Env) -> Option<Address> {
         instance_get(&env, &TOKEN)

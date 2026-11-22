@@ -228,6 +228,69 @@ fn withdraw_amount_rejects_over_balance() {
     assert_eq!(result, Err(Ok(Error::PaymentInsufficientBalance)));
 }
 
+#[test]
+fn settlement_uses_preferred_asset_when_reserve_is_available() {
+    let fx = setup();
+    let recipient = Address::generate(&fx.env);
+    mint_tokens(&fx.env, &fx.token_addr, &fx.contract_id, 500);
+
+    let selected = fx.client.settle_with_fallback(
+        &fx.admin, &recipient, &fx.token_addr, &fx.token_addr, &250,
+    );
+
+    assert_eq!(selected, fx.token_addr);
+    assert_eq!(fx.token_client.balance(&recipient), 250);
+}
+
+#[test]
+fn settlement_falls_back_when_preferred_reserve_is_insufficient() {
+    let fx = setup();
+    let fallback = fx.env.register_stellar_asset_contract(fx.admin.clone());
+    let fallback_client = token::Client::new(&fx.env, &fallback);
+    let recipient = Address::generate(&fx.env);
+    fx.client.add_supported_token(&fx.admin, &fallback);
+    mint_tokens(&fx.env, &fallback, &fx.contract_id, 600);
+
+    let selected = fx.client.settle_with_fallback(
+        &fx.admin, &recipient, &fx.token_addr, &fallback, &500,
+    );
+
+    assert_eq!(selected, fallback);
+    assert_eq!(fallback_client.balance(&recipient), 500);
+}
+
+#[test]
+fn settlement_fails_without_reserve_and_is_retryable_after_funding() {
+    let fx = setup();
+    let fallback = fx.env.register_stellar_asset_contract(fx.admin.clone());
+    let recipient = Address::generate(&fx.env);
+    fx.client.add_supported_token(&fx.admin, &fallback);
+
+    let result = fx.client.try_settle_with_fallback(
+        &fx.admin, &recipient, &fx.token_addr, &fallback, &500,
+    );
+    assert_eq!(result, Err(Ok(Error::PaymentInsufficientBalance)));
+
+    mint_tokens(&fx.env, &fallback, &fx.contract_id, 500);
+    assert_eq!(
+        fx.client.settle_with_fallback(&fx.admin, &recipient, &fx.token_addr, &fallback, &500),
+        fallback
+    );
+}
+
+#[test]
+fn settlement_requires_admin_authorization() {
+    let fx = setup();
+    let outsider = Address::generate(&fx.env);
+    let recipient = Address::generate(&fx.env);
+    mint_tokens(&fx.env, &fx.token_addr, &fx.contract_id, 500);
+
+    let result = fx.client.try_settle_with_fallback(
+        &outsider, &recipient, &fx.token_addr, &fx.token_addr, &250,
+    );
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
 // ---------------------------------------------------------------------------
 // Escrow
 // ---------------------------------------------------------------------------
