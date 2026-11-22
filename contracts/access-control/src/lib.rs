@@ -85,6 +85,14 @@ pub enum AccessControlError {
     CapabilityRevoked = 228,
     CapabilityActionMismatch = 229,
     InvalidCapabilityLifetime = 230,
+    /// A lockdown request is already pending or active.
+    LockdownAlreadyActive = 231,
+    /// No emergency lockdown request exists.
+    NoPendingLockdown = 232,
+    /// The emergency lockdown request has expired.
+    LockdownExpired = 233,
+    /// The second lockdown administrator must be distinct from the first.
+    LockdownApproverMustDiffer = 234,
 }
 
 type ContractResult<T> = core::result::Result<T, AccessControlError>;
@@ -102,6 +110,9 @@ fn is_valid_pause_scope(scope: &Symbol) -> bool {
 
 /// Fail with [`AccessControlError::OperationPaused`] when `scope` is paused.
 fn require_not_paused(env: &Env, scope: Symbol) -> ContractResult<()> {
+    if env.storage().instance().get(&DataKey::EmergencyLockdown).unwrap_or(false) {
+        return Err(AccessControlError::OperationPaused);
+    }
     if env
         .storage()
         .instance()
@@ -148,6 +159,8 @@ enum DataKey {
     PendingSuperAdmin,
     CapabilityNextId,
     Capability(u64),
+    EmergencyLockdown,
+    PendingEmergencyLockdown,
 }
 
 pub const MAX_CAPABILITY_LIFETIME: u64 = 7 * 24 * 60 * 60;
@@ -172,6 +185,13 @@ pub struct CapabilityToken {
 pub struct Invitation {
     pub inviter: Address,
     pub role: Symbol,
+    pub expires_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingEmergencyLockdown {
+    pub initiator: Address,
     pub expires_at: u64,
 }
 
@@ -372,6 +392,86 @@ impl AccessControlContract {
             .instance()
             .get(&DataKey::PausedScope(scope))
             .unwrap_or(false)
+    }
+
+    /// Returns true while the global emergency lockdown is active.
+    pub fn is_emergency_locked(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::EmergencyLockdown).unwrap_or(false)
+    }
+
+    /// Start a two-admin emergency lockdown request. The request must be
+    /// confirmed by a different admin before the global lock becomes active.
+    pub fn request_emergency_lockdown(
+        env: Env,
+        caller: Address,
+        expires_in: u64,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if expires_in == 0 {
+            return Err(AccessControlError::InvalidExpiry);
+        }
+        if env.storage().instance().get::<bool>(&DataKey::EmergencyLockdown).unwrap_or(false)
+            || env.storage().instance().has(&DataKey::PendingEmergencyLockdown)
+        {
+            return Err(AccessControlError::LockdownAlreadyActive);
+        }
+        let pending = PendingEmergencyLockdown {
+            initiator: caller,
+            expires_at: env.ledger().timestamp().saturating_add(expires_in),
+        };
+        env.storage().instance().set(&DataKey::PendingEmergencyLockdown, &pending);
+        Ok(())
+    }
+
+    /// Confirm a pending lockdown with a distinct admin.
+    pub fn confirm_emergency_lockdown(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        let pending: PendingEmergencyLockdown = env.storage().instance().get(&DataKey::PendingEmergencyLockdown).ok_or(AccessControlError::NoPendingLockdown)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            env.storage().instance().remove(&DataKey::PendingEmergencyLockdown);
+            return Err(AccessControlError::LockdownExpired);
+        }
+        if caller == pending.initiator {
+            return Err(AccessControlError::LockdownApproverMustDiffer);
+        }
+        env.storage().instance().remove(&DataKey::PendingEmergencyLockdown);
+        env.storage().instance().set(&DataKey::EmergencyLockdown, &true);
+        Ok(())
+    }
+
+    /// Cancel a pending request. Active lockdowns are cleared only through
+    /// `unlock_emergency_lockdown`, which requires two distinct admins.
+    pub fn cancel_emergency_lockdown(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if !env.storage().instance().has(&DataKey::PendingEmergencyLockdown) {
+            return Err(AccessControlError::NoPendingLockdown);
+        }
+        env.storage().instance().remove(&DataKey::PendingEmergencyLockdown);
+        Ok(())
+    }
+
+    /// Unlock the contract with two distinct, independently authorized admins.
+    pub fn unlock_emergency_lockdown(
+        env: Env,
+        caller_a: Address,
+        caller_b: Address,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller_a, &Action::ManageMaintainers)?;
+        require_action(&env, &caller_b, &Action::ManageMaintainers)?;
+        if caller_a == caller_b {
+            return Err(AccessControlError::LockdownApproverMustDiffer);
+        }
+        if !env.storage().instance().get::<bool>(&DataKey::EmergencyLockdown).unwrap_or(false) {
+            return Err(AccessControlError::NoPendingLockdown);
+        }
+        env.storage().instance().set(&DataKey::EmergencyLockdown, &false);
+        Ok(())
     }
 
     /// Pause a scoped operation family.  Only admins may call this.
@@ -2866,6 +2966,52 @@ mod tests {
         let fresh = client.issue_capability(&super_admin, &operator, &action, &100, &1);
         client.pause_with_capability(&operator, &PAUSE_SCOPE_ROLES, &fresh);
         assert!(client.is_paused(&PAUSE_SCOPE_ROLES));
+    }
+
+    #[test]
+    fn emergency_lockdown_requires_two_distinct_admins_and_supports_cancel_and_expiry() {
+        let (env, admin_a, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let admin_b = Address::generate(&env);
+        client.add_admin(&admin_a, &admin_b);
+
+        env.ledger().set_timestamp(100);
+        client.request_emergency_lockdown(&admin_a, &10);
+        assert_eq!(
+            client.try_confirm_emergency_lockdown(&admin_a),
+            Err(Ok(AccessControlError::LockdownApproverMustDiffer))
+        );
+        env.ledger().set_timestamp(111);
+        assert_eq!(
+            client.try_confirm_emergency_lockdown(&admin_b),
+            Err(Ok(AccessControlError::LockdownExpired))
+        );
+        client.request_emergency_lockdown(&admin_a, &100);
+        client.cancel_emergency_lockdown(&admin_a);
+        assert!(!client.is_emergency_locked());
+    }
+
+    #[test]
+    fn emergency_lockdown_blocks_mutations_until_two_admin_unlock() {
+        let (env, admin_a, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let admin_b = Address::generate(&env);
+        let role = symbol_short!("operator");
+        client.add_admin(&admin_a, &admin_b);
+        client.request_emergency_lockdown(&admin_a, &100);
+        client.confirm_emergency_lockdown(&admin_b);
+        assert!(client.is_emergency_locked());
+        assert_eq!(
+            client.try_create_role(&admin_a, &role),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+        assert_eq!(
+            client.try_unlock_emergency_lockdown(&admin_a, &admin_a),
+            Err(Ok(AccessControlError::LockdownApproverMustDiffer))
+        );
+        client.unlock_emergency_lockdown(&admin_a, &admin_b);
+        client.create_role(&admin_a, &role);
+        assert!(!client.is_emergency_locked());
     }
 
 }
